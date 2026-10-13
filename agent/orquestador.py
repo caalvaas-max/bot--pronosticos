@@ -1,6 +1,7 @@
 """Orquestador principal del agente."""
 from __future__ import annotations
 import logging
+import math
 from dataclasses import dataclass, field
 
 from agent.validacion import validar_texto
@@ -11,6 +12,13 @@ from models.ensemble import combinar_1x2
 from auditoria.guardar import GuardadorPronosticos, DatosPronostico
 
 logger = logging.getLogger(__name__)
+
+CORNERES_PROM = 10.0
+TARJETAS_PROM = 4.5
+
+
+def _poisson_prob(k: int, lam: float) -> float:
+    return (lam ** k) * math.exp(-lam) / math.factorial(k)
 
 
 @dataclass
@@ -82,6 +90,23 @@ class Orquestador:
                     mejor_prob = p
                     mejor_marcador = f"{i}-{j}"
 
+        h_local_m05 = probs_final["local"]
+        h_local_m1 = sum(
+            float(matriz[i, j])
+            for i in range(matriz.shape[0])
+            for j in range(matriz.shape[1])
+            if i - j > 1
+        )
+        h_visitante_p05 = probs_final["visitante"] + probs_final["empate"]
+
+        p_corners_over_85 = 1.0 - sum(_poisson_prob(k, CORNERES_PROM) for k in range(9))
+        p_corners_over_95 = 1.0 - sum(_poisson_prob(k, CORNERES_PROM) for k in range(10))
+        p_corners_over_105 = 1.0 - sum(_poisson_prob(k, CORNERES_PROM) for k in range(11))
+
+        p_tarj_over_35 = 1.0 - sum(_poisson_prob(k, TARJETAS_PROM) for k in range(4))
+        p_tarj_over_45 = 1.0 - sum(_poisson_prob(k, TARJETAS_PROM) for k in range(5))
+        p_tarj_over_55 = 1.0 - sum(_poisson_prob(k, TARJETAS_PROM) for k in range(6))
+
         mercados = {
             "over_15": over15,
             "under_15": under15,
@@ -91,6 +116,15 @@ class Orquestador:
             "under_35": under35,
             "btts_si": btts_si,
             "btts_no": btts_no,
+            "h_local_m05": h_local_m05,
+            "h_local_m1": h_local_m1,
+            "h_visitante_p05": h_visitante_p05,
+            "corners_over_85": p_corners_over_85,
+            "corners_over_95": p_corners_over_95,
+            "corners_over_105": p_corners_over_105,
+            "tarj_over_35": p_tarj_over_35,
+            "tarj_over_45": p_tarj_over_45,
+            "tarj_over_55": p_tarj_over_55,
         }
 
         max_prob = max(probs_final.values())
