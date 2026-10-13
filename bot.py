@@ -22,31 +22,54 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 orquestador = Orquestador(bankroll=1000.0)
 calculadora = CalculadoraMetricas()
 
+SEP = "+----------------+----------+--------+"
+SEP_LARGO = "+----------------+--------+--------+"
+
 
 def _cuadro_pronostico(r) -> str:
     p = r.probabilidades
     m = r.mercados
-    sep = "+----------------+----------+--------+"
+
+    l1 = p["local"] + p["empate"]
+    l2 = p["local"] + p["visitante"]
+    l3 = p["empate"] + p["visitante"]
+
     lineas = [
-        sep,
+        SEP,
         "| MERCADO        | SELECCION |  PROB  |",
-        sep,
-        f"| 1X2            | Local     | {p['local']*100:5.1f}% |",
-        f"| 1X2            | Empate    | {p['empate']*100:5.1f}% |",
-        f"| 1X2            | Visita    | {p['visitante']*100:5.1f}% |",
-        sep,
-        f"| Over/Under     | Over 1.5  | {m['over_15']*100:5.1f}% |",
-        f"| Over/Under     | Under 1.5 | {m['under_15']*100:5.1f}% |",
-        f"| Over/Under     | Over 2.5  | {m['over_25']*100:5.1f}% |",
-        f"| Over/Under     | Under 2.5 | {m['under_25']*100:5.1f}% |",
-        f"| Over/Under     | Over 3.5  | {m['over_35']*100:5.1f}% |",
-        f"| Over/Under     | Under 3.5 | {m['under_35']*100:5.1f}% |",
-        sep,
+        SEP,
+        f"| Ganador        | Local     | {p['local']*100:5.1f}% |",
+        f"| Ganador        | Empate    | {p['empate']*100:5.1f}% |",
+        f"| Ganador        | Visita    | {p['visitante']*100:5.1f}% |",
+        SEP,
+        f"| Doble Oport.   | 1X        | {l1*100:5.1f}% |",
+        f"| Doble Oport.   | 12        | {l2*100:5.1f}% |",
+        f"| Doble Oport.   | X2        | {l3*100:5.1f}% |",
+        SEP,
+        f"| Goles Totales  | Over 1.5  | {m['over_15']*100:5.1f}% |",
+        f"| Goles Totales  | Under 1.5 | {m['under_15']*100:5.1f}% |",
+        f"| Goles Totales  | Over 2.5  | {m['over_25']*100:5.1f}% |",
+        f"| Goles Totales  | Under 2.5 | {m['under_25']*100:5.1f}% |",
+        f"| Goles Totales  | Over 3.5  | {m['over_35']*100:5.1f}% |",
+        f"| Goles Totales  | Under 3.5 | {m['under_35']*100:5.1f}% |",
+        SEP,
         f"| Ambos Anotan   | Si        | {m['btts_si']*100:5.1f}% |",
         f"| Ambos Anotan   | No        | {m['btts_no']*100:5.1f}% |",
-        sep,
+        SEP,
+        f"| Handicap       | Local -1  | {m['h_local_m1']*100:5.1f}% |",
+        f"| Handicap       | Local -0.5| {m['h_local_m05']*100:5.1f}% |",
+        f"| Handicap       | Visita+.5 | {m['h_visitante_p05']*100:5.1f}% |",
+        SEP,
+        f"| Corners        | Over 8.5  | {m['corners_over_85']*100:5.1f}% |",
+        f"| Corners        | Over 9.5  | {m['corners_over_95']*100:5.1f}% |",
+        f"| Corners        | Over 10.5 | {m['corners_over_105']*100:5.1f}% |",
+        SEP,
+        f"| Tarjetas       | Over 3.5  | {m['tarj_over_35']*100:5.1f}% |",
+        f"| Tarjetas       | Over 4.5  | {m['tarj_over_45']*100:5.1f}% |",
+        f"| Tarjetas       | Over 5.5  | {m['tarj_over_55']*100:5.1f}% |",
+        SEP,
         f"| Marcador       | {r.marcador_top:>9} | {r.marcador_prob*100:5.1f}% |",
-        sep,
+        SEP,
     ]
     return "\n".join(lineas)
 
