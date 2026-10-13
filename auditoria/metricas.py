@@ -8,6 +8,7 @@ from auditoria.guardar import PronosticoDB
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class Metricas:
     total: int
@@ -17,6 +18,7 @@ class Metricas:
     brier_score: float
     log_loss: float
     roi: float
+
 
 class CalculadoraMetricas:
     def calcular(self) -> Metricas:
@@ -61,5 +63,32 @@ class CalculadoraMetricas:
             log_loss=logloss,
             roi=roi,
         )
+
+    def tabla_por_partido(self) -> dict:
+        """Retorna tabla: mercados x partidos con ACERTO/FALLIDO."""
+        with get_session() as s:
+            pronosticos = s.query(PronosticoDB).filter(
+                PronosticoDB.resultado.in_(["ACERTADO", "FALLADO"])
+            ).all()
+
+        partidos = []
+        tabla = {}
+
+        for p in pronosticos:
+            etiqueta = f"{p.local[:6]}-{p.visitante[:6]}"
+            if etiqueta not in partidos:
+                partidos.append(etiqueta)
+
+            clave = f"{p.mercado} {p.seleccion}".strip()
+            if clave not in tabla:
+                tabla[clave] = {}
+
+            if p.resultado == "ACERTADO":
+                tabla[clave][etiqueta] = "ACERTO"
+            else:
+                tabla[clave][etiqueta] = "DESACERTO"
+
+        return {"partidos": partidos, "tabla": tabla}
+
 
 __all__ = ["CalculadoraMetricas", "Metricas"]
