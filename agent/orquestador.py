@@ -1,11 +1,9 @@
-"""Orquestador principal del agente con datos reales de Bzzoiro."""
+"""Orquestador principal con datos reales de Bzzoiro."""
 from __future__ import annotations
-import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
 
-from agent.validacion import validar_texto, ConsultaPartido, ValidacionError
+from agent.validacion import validar_texto, ValidacionError
 from models.poisson_bivariante import PoissonBivariante
 from models.goles import calcular_lambda
 from models.pi_ratings import PiRatings
@@ -39,7 +37,6 @@ class Orquestador:
         consulta = validar_texto(texto)
         logger.info(f"Procesando: {consulta.local} vs {consulta.visitante}")
 
-        # Intentar obtener datos reales de Bzzoiro
         lambda_local = 1.5
         lambda_visitante = 1.2
         datos_reales = False
@@ -50,36 +47,35 @@ class Orquestador:
             )
             if partido:
                 evento_id = partido.get("id")
-                logger.info(f"Partido encontrado en Bzzoiro: {evento_id}")
+                logger.info(f"Partido encontrado: {evento_id}")
 
-                stats = await self.bzzoiro.stats_partido(evento_id)
-                if stats and "stats" in stats:
-                    home_xg = stats["stats"].get("home", {}).get("xg", {})
-                    away_xg = stats["stats"].get("away", {}).get("xg", {})
-                    xg_home = home_xg.get("actual") if isinstance(home_xg, dict) else None
-                    xg_away = away_xg.get("actual") if isinstance(away_xg, dict) else None
-                    if xg_home and xg_away:
-                        lambda_local = float(xg_home)
-                        lambda_visitante = float(xg_away)
-                        datos_reales = True
-                        logger.info(f"xG reales: {lambda_local} vs {lambda_visitante}")
+                pred = await self.bzzoiro.predicciones(evento_id)
+                logger.info(f"Predicciones: {str(pred)[:200]}")
+
+                if pred:
+                    probs_bz = pred.get("predictions") or pred.get("probabilities") or pred
+                    if isinstance(probs_bz, dict):
+                        home_goals = probs_bz.get("home_goals_avg") or probs_bz.get("home_expected_goals")
+                        away_goals = probs_bz.get("away_goals_avg") or probs_bz.get("away_expected_goals")
+                        if home_goals and away_goals:
+                            lambda_local = float(home_goals)
+                            lambda_visitante = float(away_goals)
+                            datos_reales = True
+                            logger.info(f"Goles reales: {lambda_local} - {lambda_visitante}")
         except Exception as e:
             logger.warning(f"Bzzoiro no disponible: {e}")
 
         goles = calcular_lambda(lambda_local, lambda_local, lambda_visitante, lambda_visitante)
-
         matriz = self.poisson.calcular_matriz(goles.lambda_local, goles.lambda_visitante)
-
         p1x2 = self.poisson.calcular_1x2(goles.lambda_local, goles.lambda_visitante)
+
         prob_poisson_dict = {
             "local": p1x2.local,
             "empate": p1x2.empate,
             "visitante": p1x2.visitante,
         }
 
-        prob_local_pi = self.pi_ratings.probabilidad_local(
-            consulta.local, consulta.visitante
-        )
+        prob_local_pi = self.pi_ratings.probabilidad_local(consulta.local, consulta.visitante)
         prob_pi_dict = {
             "local": prob_local_pi,
             "empate": 0.25,
@@ -118,26 +114,18 @@ class Orquestador:
             confianza = "baja"
 
         respuesta = RespuestaPronostico(
-            local=consulta.local,
-            visitante=consulta.visitante,
-            probabilidades=probs_final,
-            mercados=mercados,
-            confianza=confianza,
-            marcador_top=mejor_marcador,
-            marcador_prob=mejor_prob,
-            datos_reales=datos_reales,
+            local=consulta.local, visitante=consulta.visitante,
+            probabilidades=probs_final, mercados=mercados,
+            confianza=confianza, marcador_top=mejor_marcador,
+            marcador_prob=mejor_prob, datos_reales=datos_reales,
         )
 
         if guardar:
             datos = DatosPronostico(
                 evento_id=f"{consulta.local}_{consulta.visitante}",
-                liga="desconocida",
-                local=consulta.local,
-                visitante=consulta.visitante,
-                mercado="1x2",
-                seleccion="principal",
-                probabilidad=max_prob,
-                confianza=confianza,
+                liga="desconocida", local=consulta.local,
+                visitante=consulta.visitante, mercado="1x2",
+                seleccion="principal", probabilidad=max_prob, confianza=confianza,
             )
             try:
                 self.guardador.guardar(datos)
