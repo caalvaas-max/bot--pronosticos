@@ -22,7 +22,7 @@ calculadora = CalculadoraMetricas()
 def formatear_cuadro(r) -> str:
     p = r.probabilidades
     m = r.mercados
-    fuente = "REAL (Bzzoiro)" if r.datos_reales else "APROX"
+    fuente = r.fuente
 
     doble_1x = p['local'] + p['empate']
     doble_12 = p['local'] + p['visitante']
