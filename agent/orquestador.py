@@ -38,34 +38,33 @@ class Orquestador:
         if not self.api_key:
             logger.warning("BZZOIRO_API_KEY no configurada")
             return None
+        
         headers = {"Authorization": f"Token {self.api_key}"}
+        
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
-                # Usamos /events/ en lugar de /matches/ porque es el estándar de Bzzoiro
-                r = await c.get(f"{BASE_URL}/events/", headers=headers, params={"search": f"{local} {visitante}"})
-                
+                # Pedimos las predicciones (vienen en una lista gigante)
+                r = await c.get(f"{BASE_URL}/predictions/", headers=headers)
                 if r.status_code != 200:
-                    logger.error(f"Error buscando partido: {r.status_code} - {r.text}")
+                    logger.error(f"Error API Bzzoiro: {r.status_code}")
                     return None
                     
                 data = r.json()
-                results = data.get("results", data.get("data", []))
+                results = data.get("results", [])
                 
-                if not results:
-                    logger.warning(f"No se encontraron partidos para {local} vs {visitante}")
-                    return None
-                
-                partido_id = results[0].get("id")
-                logger.info(f"Partido encontrado ID: {partido_id}")
-                
-                # Consultar predicciones
-                r_pred = await c.get(f"{BASE_URL}/predictions/{partido_id}/", headers=headers)
-                if r_pred.status_code == 200:
-                    logger.info(f"Predicción obtenida para ID {partido_id}")
-                    return r_pred.json()
-                else:
-                    logger.warning(f"Sin predicción para ID {partido_id}: {r_pred.status_code}")
-                    return None
+                # Buscamos el partido que coincida
+                for item in results:
+                    ev = item.get("event", {})
+                    # Como no vimos las llaves exactas del evento, probamos las variantes más comunes
+                    h_name = str(ev.get("home_team", ev.get("home", ev.get("local", "")))).lower()
+                    a_name = str(ev.get("away_team", ev.get("away", ev.get("visitante", "")))).lower()
+                    
+                    if local.lower() in h_name and visitante.lower() in a_name:
+                        logger.info(f"¡Partido encontrado en Bzzoiro!")
+                        return item
+                        
+                logger.warning(f"No se encontró {local} vs {visitante} en Bzzoiro")
+                return None
                     
         except Exception as e:
             logger.error(f"Error crítico en Bzzoiro: {e}")
@@ -79,23 +78,36 @@ class Orquestador:
         
         fuente = "APROX"
         probs_final = {}
+        mercados_bzz = {}
 
-        if prediccion_bzz and "probabilities" in prediccion_bzz:
+        if prediccion_bzz and "markets" in prediccion_bzz:
             fuente = "BZZOIRO"
-            probs_bzz = prediccion_bzz["probabilities"]
-            try:
+            mkts = prediccion_bzz["markets"]
+            
+            # 1. Extraer 1X2
+            mr = mkts.get("match_result", {})
+            if mr:
                 probs_final = {
-                    "local": float(probs_bzz.get("home", 0.33)),
-                    "empate": float(probs_bzz.get("draw", 0.33)),
-                    "visitante": float(probs_bzz.get("away", 0.33))
+                    "local": float(mr.get("prob_home", 0)) / 100.0,
+                    "empate": float(mr.get("prob_draw", 0)) / 100.0,
+                    "visitante": float(mr.get("prob_away", 0)) / 100.0
                 }
-                if sum(probs_final.values()) > 2.0:
-                    probs_final = {k: v/100.0 for k, v in probs_final.items()}
-            except Exception as e:
-                logger.error(f"Error parseando Bzzoiro: {e}")
-                fuente = "APROX"
+            
+            # 2. Extraer otros mercados (si están disponibles)
+            ou = mkts.get("over_under", {})
+            if ou:
+                mercados_bzz["over_15"] = float(ou.get("prob_over_15", 0)) / 100.0
+                mercados_bzz["over_25"] = float(ou.get("prob_over_25", 0)) / 100.0
+                mercados_bzz["over_35"] = float(ou.get("prob_over_35", 0)) / 100.0
+            
+            btts = mkts.get("btts", {})
+            if btts:
+                mercados_bzz["btts_si"] = float(btts.get("prob_yes", 0)) / 100.0
+                mercados_bzz["btts_no"] = float(btts.get("prob_no", 0)) / 100.0
         
-        if fuente == "APROX":
+        # Si falló Bzzoiro o no hay probs, usamos respaldo (Poisson)
+        if fuente == "APROX" or not probs_final:
+            fuente = "APROX"
             goles = calcular_lambda(1.5, 1.2, 1.5, 1.2)
             p1x2 = self.poisson.calcular_1x2(goles.lambda_local, goles.lambda_visitante)
             prob_poisson_dict = {"local": p1x2.local, "empate": p1x2.empate, "visitante": p1x2.visitante}
@@ -103,12 +115,23 @@ class Orquestador:
             prob_pi_dict = {"local": prob_local_pi, "empate": 0.25, "visitante": max(0.0, 1.0 - prob_local_pi - 0.25)}
             probs_final = combinar_1x2(prob_poisson_dict, prob_pi_dict)
 
+        # Calcular matriz para el marcador exacto (siempre con Poisson o datos base)
         goles = calcular_lambda(1.5, 1.2, 1.5, 1.2)
         matriz = self.poisson.calcular_matriz(goles.lambda_local, goles.lambda_visitante)
-        over15, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 1.5)
-        over25, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 2.5)
-        over35, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 3.5)
-        btts_si, btts_no = self.poisson.calcular_btts(goles.lambda_local, goles.lambda_visitante)
+        
+        # Llenar los mercados faltantes con Poisson
+        o15, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 1.5)
+        o25, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 2.5)
+        o35, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 3.5)
+        b_si, b_no = self.poisson.calcular_btts(goles.lambda_local, goles.lambda_visitante)
+
+        mercados = {
+            "over_15": mercados_bzz.get("over_15", o15),
+            "over_25": mercados_bzz.get("over_25", o25),
+            "over_35": mercados_bzz.get("over_35", o35),
+            "btts_si": mercados_bzz.get("btts_si", b_si),
+            "btts_no": mercados_bzz.get("btts_no", b_no),
+        }
 
         mejor_marcador = ""
         mejor_prob = 0.0
@@ -119,7 +142,6 @@ class Orquestador:
                     mejor_prob = p
                     mejor_marcador = f"{i}-{j}"
 
-        mercados = {"over_15": over15, "over_25": over25, "over_35": over35, "btts_si": btts_si, "btts_no": btts_no}
         max_prob = max(probs_final.values())
         confianza = "alta" if max_prob > 0.55 else ("media" if max_prob > 0.45 else "baja")
 
