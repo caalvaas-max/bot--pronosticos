@@ -1,4 +1,4 @@
-"""Orquestador principal del agente CON datos reales de Bzzoiro v2."""
+"""Orquestador principal con diagnostico integrado."""
 from __future__ import annotations
 import logging
 import os
@@ -34,57 +34,53 @@ class Orquestador:
         self.guardador = GuardadorPronosticos()
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
 
-    async def _consultar_bzzoiro(self, local: str, visitante: str) -> Optional[dict]:
+    async def _consultar_bzzoiro(self, local: str, visitante: str) -> dict:
         if not self.api_key:
-            logger.warning("BZZOIRO_API_KEY no configurada")
-            return None
-        
+            return {"error": "BZZOIRO_API_KEY vacia en Railway"}
+            
         headers = {"Authorization": f"Token {self.api_key}"}
-        
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
-                # Pedimos las predicciones (vienen en una lista gigante)
                 r = await c.get(f"{BASE_URL}/predictions/", headers=headers)
                 if r.status_code != 200:
-                    logger.error(f"Error API Bzzoiro: {r.status_code}")
-                    return None
+                    return {"error": f"API Status {r.status_code}"}
                     
                 data = r.json()
                 results = data.get("results", [])
                 
-                # Buscamos el partido que coincida
+                if not results:
+                    return {"error": "Lista de resultados vacia"}
+                
+                # DEBUG: Guardamos una muestra del primer evento para ver sus llaves
+                muestra = str(results[0].get("event", {}))[:80]
+                
                 for item in results:
                     ev = item.get("event", {})
-                    # Como no vimos las llaves exactas del evento, probamos las variantes más comunes
                     h_name = str(ev.get("home_team", ev.get("home", ev.get("local", "")))).lower()
                     a_name = str(ev.get("away_team", ev.get("away", ev.get("visitante", "")))).lower()
                     
                     if local.lower() in h_name and visitante.lower() in a_name:
-                        logger.info(f"¡Partido encontrado en Bzzoiro!")
-                        return item
+                        return {"success": True, "data": item}
                         
-                logger.warning(f"No se encontró {local} vs {visitante} en Bzzoiro")
-                return None
+                return {"error": f"No se encontro. Ejemplo: {muestra}"}
                     
         except Exception as e:
-            logger.error(f"Error crítico en Bzzoiro: {e}")
-            return None
+            return {"error": f"Excepcion: {str(e)}"}
 
     async def procesar(self, texto: str, guardar: bool = True) -> RespuestaPronostico:
         consulta = validar_texto(texto)
-        logger.info(f"Procesando: {consulta.local} vs {consulta.visitante}")
         
-        prediccion_bzz = await self._consultar_bzzoiro(consulta.local, consulta.visitante)
+        res = await self._consultar_bzzoiro(consulta.local, consulta.visitante)
         
         fuente = "APROX"
         probs_final = {}
         mercados_bzz = {}
 
-        if prediccion_bzz and "markets" in prediccion_bzz:
+        if "success" in res:
             fuente = "BZZOIRO"
-            mkts = prediccion_bzz["markets"]
+            prediccion_bzz = res["data"]
+            mkts = prediccion_bzz.get("markets", {})
             
-            # 1. Extraer 1X2
             mr = mkts.get("match_result", {})
             if mr:
                 probs_final = {
@@ -93,7 +89,6 @@ class Orquestador:
                     "visitante": float(mr.get("prob_away", 0)) / 100.0
                 }
             
-            # 2. Extraer otros mercados (si están disponibles)
             ou = mkts.get("over_under", {})
             if ou:
                 mercados_bzz["over_15"] = float(ou.get("prob_over_15", 0)) / 100.0
@@ -104,10 +99,10 @@ class Orquestador:
             if btts:
                 mercados_bzz["btts_si"] = float(btts.get("prob_yes", 0)) / 100.0
                 mercados_bzz["btts_no"] = float(btts.get("prob_no", 0)) / 100.0
-        
-        # Si falló Bzzoiro o no hay probs, usamos respaldo (Poisson)
-        if fuente == "APROX" or not probs_final:
-            fuente = "APROX"
+
+        else:
+            # Si falló, pasamos el mensaje de error a la fuente para verlo en Telegram
+            fuente = f"ERROR: {res.get('error', 'Desconocido')[:40]}"
             goles = calcular_lambda(1.5, 1.2, 1.5, 1.2)
             p1x2 = self.poisson.calcular_1x2(goles.lambda_local, goles.lambda_visitante)
             prob_poisson_dict = {"local": p1x2.local, "empate": p1x2.empate, "visitante": p1x2.visitante}
@@ -115,11 +110,9 @@ class Orquestador:
             prob_pi_dict = {"local": prob_local_pi, "empate": 0.25, "visitante": max(0.0, 1.0 - prob_local_pi - 0.25)}
             probs_final = combinar_1x2(prob_poisson_dict, prob_pi_dict)
 
-        # Calcular matriz para el marcador exacto (siempre con Poisson o datos base)
         goles = calcular_lambda(1.5, 1.2, 1.5, 1.2)
         matriz = self.poisson.calcular_matriz(goles.lambda_local, goles.lambda_visitante)
         
-        # Llenar los mercados faltantes con Poisson
         o15, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 1.5)
         o25, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 2.5)
         o35, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 3.5)
