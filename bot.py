@@ -2,11 +2,9 @@
 from __future__ import annotations
 import logging
 import os
-import inspect
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from agent.orquestador import Orquestador
-from agent.validacion import ValidacionError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -24,13 +22,8 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Analizando...")
     
     try:
-        # PARCHE MAESTRO: Detecta si la función es asíncrona o síncrona
-        resultado = orquestador.procesar(texto, guardar=True)
-        if inspect.isawaitable(resultado):
-            r = await resultado
-        else:
-            r = resultado
-            
+        # AHORA SÍ: procesar es async, por lo que usamos await correctamente
+        r = await orquestador.procesar(texto, guardar=True)
         p = r.probabilidades
         m = r.mercados
         
@@ -41,16 +34,16 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ├─────────────────────────────────┤
 │ MERCADO        │ SELECCION │ PROB
 ├─────────────────────────────────┤
-│ Ganador        │ Local     │ {p.get('local',0)*100:.1f}%
-│ Ganador        │ Empate    │ {p.get('empate',0)*100:.1f}%
-│ Ganador        │ Visita    │ {p.get('visitante',0)*100:.1f}%
+│ Ganador        │ Local     │ {p['local']*100:.1f}%
+│ Ganador        │ Empate    │ {p['empate']*100:.1f}%
+│ Ganador        │ Visita    │ {p['visitante']*100:.1f}%
 ├─────────────────────────────────┤
-│ Goles          │ Over 1.5  │ {m.get('over_15',0)*100:.1f}%
-│ Goles          │ Over 2.5  │ {m.get('over_25',0)*100:.1f}%
-│ Goles          │ Over 3.5  │ {m.get('over_35',0)*100:.1f}%
+│ Goles          │ Over 1.5  │ {m['over_15']*100:.1f}%
+│ Goles          │ Over 2.5  │ {m['over_25']*100:.1f}%
+│ Goles          │ Over 3.5  │ {m['over_35']*100:.1f}%
 ├─────────────────────────────────┤
-│ Ambos Anotan   │ Si        │ {m.get('btts_si',0)*100:.1f}%
-│ Ambos Anotan   │ No        │ {m.get('btts_no',0)*100:.1f}%
+│ Ambos Anotan   │ Si        │ {m['btts_si']*100:.1f}%
+│ Ambos Anotan   │ No        │ {m['btts_no']*100:.1f}%
 ├─────────────────────────────────┤
 │ Marcador Top   │ {r.marcador_top}       │ {r.marcador_prob*100:.1f}%
 └─────────────────────────────────┘
@@ -58,7 +51,7 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """
         await update.message.reply_text(f"```\n{cuadro}\n```", parse_mode="MarkdownV2")
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error en bot: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
 
 def main():

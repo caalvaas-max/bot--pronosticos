@@ -41,28 +41,40 @@ class Orquestador:
         headers = {"Authorization": f"Token {self.api_key}"}
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
-                # Probamos buscar en matches/ o events/
-                r = await c.get(f"{BASE_URL}/matches/", headers=headers, params={"search": f"{local} {visitante}"})
+                # Usamos /events/ en lugar de /matches/ porque es el estándar de Bzzoiro
+                r = await c.get(f"{BASE_URL}/events/", headers=headers, params={"search": f"{local} {visitante}"})
+                
                 if r.status_code != 200:
-                    logger.error(f"Error buscando: {r.status_code}")
+                    logger.error(f"Error buscando partido: {r.status_code} - {r.text}")
                     return None
+                    
                 data = r.json()
                 results = data.get("results", data.get("data", []))
+                
                 if not results:
+                    logger.warning(f"No se encontraron partidos para {local} vs {visitante}")
                     return None
                 
                 partido_id = results[0].get("id")
+                logger.info(f"Partido encontrado ID: {partido_id}")
+                
                 # Consultar predicciones
                 r_pred = await c.get(f"{BASE_URL}/predictions/{partido_id}/", headers=headers)
                 if r_pred.status_code == 200:
+                    logger.info(f"Predicción obtenida para ID {partido_id}")
                     return r_pred.json()
-                return None
+                else:
+                    logger.warning(f"Sin predicción para ID {partido_id}: {r_pred.status_code}")
+                    return None
+                    
         except Exception as e:
-            logger.error(f"Error Bzzoiro: {e}")
+            logger.error(f"Error crítico en Bzzoiro: {e}")
             return None
 
     async def procesar(self, texto: str, guardar: bool = True) -> RespuestaPronostico:
         consulta = validar_texto(texto)
+        logger.info(f"Procesando: {consulta.local} vs {consulta.visitante}")
+        
         prediccion_bzz = await self._consultar_bzzoiro(consulta.local, consulta.visitante)
         
         fuente = "APROX"
@@ -79,7 +91,8 @@ class Orquestador:
                 }
                 if sum(probs_final.values()) > 2.0:
                     probs_final = {k: v/100.0 for k, v in probs_final.items()}
-            except Exception:
+            except Exception as e:
+                logger.error(f"Error parseando Bzzoiro: {e}")
                 fuente = "APROX"
         
         if fuente == "APROX":
@@ -92,7 +105,6 @@ class Orquestador:
 
         goles = calcular_lambda(1.5, 1.2, 1.5, 1.2)
         matriz = self.poisson.calcular_matriz(goles.lambda_local, goles.lambda_visitante)
-
         over15, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 1.5)
         over25, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 2.5)
         over35, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 3.5)
