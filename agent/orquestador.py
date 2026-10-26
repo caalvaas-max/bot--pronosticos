@@ -1,4 +1,4 @@
-"""Orquestador final - Búsqueda flexible y diagnóstico limpio."""
+"""Orquestador con paginación para encontrar cualquier partido."""
 from __future__ import annotations
 import logging
 import os
@@ -46,44 +46,36 @@ class Orquestador:
         if not self.api_key:
             return {"error": "BZZOIRO_API_KEY vacia"}
             
-        headers = {
-            "Authorization": f"Token {self.api_key}",
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/json"
-        }
+        headers = {"Authorization": f"Token {self.api_key}", "User-Agent": "Mozilla/5.0"}
+        loc_norm = normalizar(local)
+        vis_norm = normalizar(visitante)
         
         try:
-            async with httpx.AsyncClient(timeout=15.0) as c:
-                r = await c.get(f"{BASE_URL}/predictions/", headers=headers)
-                if r.status_code != 200:
-                    return {"error": f"API Status {r.status_code}"}
+            async with httpx.AsyncClient(timeout=20.0) as c:
+                # Paginamos hasta 5 páginas (250 partidos) para buscar
+                for offset in range(0, 250, 50):
+                    r = await c.get(f"{BASE_URL}/predictions/", headers=headers, params={"limit": 50, "offset": offset})
+                    if r.status_code != 200:
+                        return {"error": f"API Status {r.status_code}"}
                     
-                data = r.json()
-                results = data.get("results", [])
-                if not results:
-                    return {"error": "Lista vacia"}
-                
-                loc_norm = normalizar(local)
-                vis_norm = normalizar(visitante)
-                nombres_api = []
-                
-                for item in results:
-                    ev = item.get("event", {})
-                    h_name = str(ev.get("home_team", ev.get("home", "")))
-                    a_name = str(ev.get("away_team", ev.get("away", "")))
+                    data = r.json()
+                    results = data.get("results", [])
+                    if not results:
+                        break  # No hay más páginas
                     
-                    if h_name and a_name:
-                        nombres_api.append(f"{h_name} vs {a_name}")
-                    
-                    h_norm = normalizar(h_name)
-                    a_norm = normalizar(a_name)
-                    
-                    if (loc_norm in h_norm or h_norm in loc_norm) and \
-                       (vis_norm in a_norm or a_norm in vis_norm):
-                        return {"success": True, "data": item}
+                    for item in results:
+                        ev = item.get("event", {})
+                        h_name = str(ev.get("home_team", ""))
+                        a_name = str(ev.get("away_team", ""))
                         
-                ejemplos = " | ".join(nombres_api[:2]) if nombres_api else "Ninguno"
-                return {"error": f"No match. API tiene: {ejemplos}"}
+                        h_norm = normalizar(h_name)
+                        a_norm = normalizar(a_name)
+                        
+                        if (loc_norm in h_norm or h_norm in loc_norm) and \
+                           (vis_norm in a_norm or a_norm in vis_norm):
+                            return {"success": True, "data": item}
+                            
+                return {"error": "No se encontró el partido en Bzzoiro (paginación completa)."}
                     
         except Exception as e:
             return {"error": f"Falla: {str(e)[:30]}"}
