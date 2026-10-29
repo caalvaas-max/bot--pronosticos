@@ -14,9 +14,7 @@ orquestador = Orquestador(bankroll=1000.0)
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 <b>Bot de Pronosticos</b>\n\n"
-        "Opciones:\n"
-        "1. Escribe <code>/hoy</code> para ver los partidos disponibles y tocar un botón.\n"
-        "2. O escribe <code>/analizar Local vs Visitante</code>.",
+        "Escribe <code>/hoy</code> para ver los partidos.",
         parse_mode="HTML"
     )
 
@@ -30,7 +28,6 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     for i, p in enumerate(partidos):
-        # Agregar el reloj y la hora si está disponible
         boton_texto = f"⏰ {p['hora']} | {p['texto']}" if p['hora'] else p['texto']
         keyboard.append([InlineKeyboardButton(boton_texto, callback_data=f"an_{i}")])
 
@@ -73,6 +70,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
                 
+                marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)" if r.marcador_top else "No disponible"
+                
                 cuadro = f"""
 ┌─────────────────────────────────┐
 │ ⚽ {r.local} vs {r.visitante}
@@ -99,7 +98,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 │ Ambos Anotan   │ Si        │ {m.get('btts_si',0)*100:.1f}%
 │ Ambos Anotan   │ No        │ {m.get('btts_no',0)*100:.1f}%
 ├─────────────────────────────────┤
-│ Marcador Top   │ {r.marcador_top}       │ {r.marcador_prob*100:.1f}%
+│ Marcador Top   │ {marcador_str[:20]} │
 └─────────────────────────────────┘
 """
                 mensaje = (
@@ -136,6 +135,7 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
         hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
+        marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)" if r.marcador_top else "No disponible"
 
         cuadro = f"""
 ┌─────────────────────────────────┐
@@ -163,7 +163,7 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 │ Ambos Anotan   │ Si        │ {m.get('btts_si',0)*100:.1f}%
 │ Ambos Anotan   │ No        │ {m.get('btts_no',0)*100:.1f}%
 ├─────────────────────────────────┤
-│ Marcador Top   │ {r.marcador_top}       │ {r.marcador_prob*100:.1f}%
+│ Marcador Top   │ {marcador_str[:20]} │
 └─────────────────────────────────┘
 """
         mensaje = (

@@ -1,4 +1,4 @@
-"""Orquestador con extraccion de hora del partido."""
+"""Orquestador con correcciones de hora, marcador y handicap dinamico."""
 from __future__ import annotations
 import logging
 import os
@@ -45,13 +45,14 @@ class Orquestador:
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
 
     def _extraer_hora(self, ev: dict) -> str:
-        start_time = ev.get("start_time", ev.get("date", ""))
-        if start_time and len(start_time) >= 16:
-            try:
-                # Extraer HH:MM de un string ISO como 2026-10-28T20:00:00Z
-                return start_time[11:16]
-            except:
-                pass
+        # Buscar en todas las posibles llaves que usa la API
+        for key in ["start_time", "time", "date", "kickoff", "fixture_date"]:
+            val = ev.get(key)
+            if val and isinstance(val, str):
+                # Si es formato ISO (2026-10-28T20:00:00Z), extraer HH:MM
+                if "T" in val and len(val) >= 16:
+                    return val[11:16]
+                return val
         return ""
 
     async def obtener_partidos_disponibles(self, limite: int = 8) -> list:
@@ -147,49 +148,55 @@ class Orquestador:
                 mercados_bzz["btts_si"] = prob_yes
                 mercados_bzz["btts_no"] = 1.0 - prob_yes
             
+            # Corrección del marcador: ignorar "most_likely"
             score_mkt = mkts.get("score", {})
             if score_mkt:
-                try:
-                    mejor_marcador = max(score_mkt, key=score_mkt.get)
-                    mejor_prob = float(score_mkt[mejor_marcador]) / 100.0
-                except: pass
+                for k, v in score_mkt.items():
+                    if k != "most_likely" and float(v) > 0:
+                        try:
+                            mejor_marcador = k
+                            mejor_prob = float(v) / 100.0
+                            break
+                        except: pass
 
         else:
             fuente = f"ERROR: {res.get('error', 'Desconocido')[:40]}"
-            goles = calcular_lambda(1.6, 1.15, 1.6, 1.15)
-            p1x2 = self.poisson.calcular_1x2(goles.lambda_local, goles.lambda_visitante)
-            probs_final = {"local": p1x2.local, "empate": p1x2.empate, "visitante": p1x2.visitante}
 
         if not probs_final:
-            goles = calcular_lambda(1.6, 1.15, 1.6, 1.15)
-            p1x2 = self.poisson.calcular_1x2(goles.lambda_local, goles.lambda_visitante)
-            prob_poisson_dict = {"local": p1x2.local, "empate": p1x2.empate, "visitante": p1x2.visitante}
-            prob_local_pi = self.pi_ratings.probabilidad_local(consulta.local, consulta.visitante)
-            prob_pi_dict = {"local": prob_local_pi, "empate": 0.25, "visitante": max(0.0, 1.0 - prob_local_pi - 0.25)}
-            probs_final = combinar_1x2(prob_poisson_dict, prob_pi_dict)
+            probs_final = {"local": 0.33, "empate": 0.33, "visitante": 0.34}
 
-        goles = calcular_lambda(1.6, 1.15, 1.6, 1.15)
-        matriz = self.poisson.calcular_matriz(goles.lambda_local, goles.lambda_visitante)
+        # --- CÁLCULO DINÁMICO DE HÁNDICAP Y GOLES ---
+        # Si Bzzoiro nos dio probs, deducimos los lambdas para que la matriz sea única
+        # Una aproximación rápida: si el local es favorito, su lambda sube.
+        factor_local = probs_final["local"] / 0.33
+        factor_visitante = probs_final["visitante"] / 0.33
         
+        lambda_local_dinamico = 1.4 * factor_local
+        lambda_visitante_dinamico = 1.1 * factor_visitante
+        
+        # Si Over 2.5 es alto, subimos ambos lambdas
+        if "over_25" in mercados_bzz:
+            if mercados_bzz["over_25"] > 0.55:
+                lambda_local_dinamico *= 1.2
+                lambda_visitante_dinamico *= 1.2
+                
+        matriz = self.poisson.calcular_matriz(lambda_local_dinamico, lambda_visitante_dinamico)
+        
+        # Hándicap Asiático Dinámico
+        p_local_menos_05 = sum(matriz[i, j] for i in range(6) for j in range(6) if i > j)
+        p_local_menos_15 = sum(matriz[i, j] for i in range(6) for j in range(6) if i - j >= 2)
+        p_visita_mas_05 = sum(matriz[i, j] for i in range(6) for j in range(6) if j > i or i == j)
+
         doble_1x = probs_final.get("local", 0) + probs_final.get("empate", 0)
         doble_12 = probs_final.get("local", 0) + probs_final.get("visitante", 0)
         doble_x2 = probs_final.get("empate", 0) + probs_final.get("visitante", 0)
-        
-        p_local_menos_05 = sum(matriz[i, j] for i in range(5) for j in range(5) if i > j)
-        p_local_menos_15 = sum(matriz[i, j] for i in range(5) for j in range(5) if i - j >= 2)
-        p_visita_mas_05 = sum(matriz[i, j] for i in range(5) for j in range(5) if j > i or i == j)
-
-        o15, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 1.5)
-        o25, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 2.5)
-        o35, _ = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 3.5)
-        b_si, b_no = self.poisson.calcular_btts(goles.lambda_local, goles.lambda_visitante)
 
         mercados = {
-            "over_15": mercados_bzz.get("over_15", o15),
-            "over_25": mercados_bzz.get("over_25", o25),
-            "over_35": mercados_bzz.get("over_35", o35),
-            "btts_si": mercados_bzz.get("btts_si", b_si),
-            "btts_no": mercados_bzz.get("btts_no", b_no),
+            "over_15": mercados_bzz.get("over_15", 0.75),
+            "over_25": mercados_bzz.get("over_25", 0.50),
+            "over_35": mercados_bzz.get("over_35", 0.30),
+            "btts_si": mercados_bzz.get("btts_si", 0.50),
+            "btts_no": mercados_bzz.get("btts_no", 0.50),
             "doble_1x": doble_1x,
             "doble_12": doble_12,
             "doble_x2": doble_x2,
@@ -197,14 +204,6 @@ class Orquestador:
             "hcp_local_m15": p_local_menos_15,
             "hcp_visita_p05": p_visita_mas_05,
         }
-
-        if not mejor_marcador:
-            for i in range(5):
-                for j in range(5):
-                    p = float(matriz[i, j])
-                    if p > mejor_prob:
-                        mejor_prob = p
-                        mejor_marcador = f"{i}-{j}"
 
         max_prob = max(probs_final.values())
         confianza = "alta" if max_prob > 0.55 else ("media" if max_prob > 0.45 else "baja")
