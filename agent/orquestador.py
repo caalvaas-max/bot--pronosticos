@@ -1,4 +1,4 @@
-"""Orquestador con normalizacion de caracteres especiales (ø, å, æ)."""
+"""Orquestador con extraccion de hora del partido."""
 from __future__ import annotations
 import logging
 import os
@@ -19,11 +19,8 @@ BASE_URL = "https://sports.bzzoiro.com/api/v2"
 def normalizar(texto: str) -> str:
     if not texto: return ""
     texto = texto.lower().strip()
-    # Reemplazar letras especiales nórdicas
     texto = texto.replace('ø', 'o').replace('å', 'a').replace('æ', 'ae')
-    # Quitar tildes
     texto = ''.join(c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn')
-    # Quitar prefijos
     for prefijo in ['as ', 'fc ', 'cf ', 'real ', 'cd ', 'ca ', 'club ']:
         if texto.startswith(prefijo):
             texto = texto.replace(prefijo, '', 1)
@@ -33,6 +30,7 @@ def normalizar(texto: str) -> str:
 class RespuestaPronostico:
     local: str
     visitante: str
+    hora: str
     probabilidades: dict
     mercados: dict = field(default_factory=dict)
     confianza: str = "media"
@@ -45,6 +43,38 @@ class Orquestador:
         self.poisson = PoissonBivariante()
         self.pi_ratings = PiRatings()
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
+
+    def _extraer_hora(self, ev: dict) -> str:
+        start_time = ev.get("start_time", ev.get("date", ""))
+        if start_time and len(start_time) >= 16:
+            try:
+                # Extraer HH:MM de un string ISO como 2026-10-28T20:00:00Z
+                return start_time[11:16]
+            except:
+                pass
+        return ""
+
+    async def obtener_partidos_disponibles(self, limite: int = 8) -> list:
+        if not self.api_key:
+            return []
+        headers = {"Authorization": f"Token {self.api_key}", "User-Agent": "Mozilla/5.0"}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as c:
+                r = await c.get(f"{BASE_URL}/predictions/", headers=headers, params={"limit": limite})
+                if r.status_code == 200:
+                    data = r.json()
+                    partidos = []
+                    for item in data.get("results", []):
+                        ev = item.get("event", {})
+                        h = ev.get("home_team", "")
+                        a = ev.get("away_team", "")
+                        hora = self._extraer_hora(ev)
+                        if h and a:
+                            partidos.append({"texto": f"{h} vs {a}", "hora": hora})
+                    return partidos
+        except Exception as e:
+            logger.error(f"Error obteniendo partidos: {e}")
+        return []
 
     async def _consultar_bzzoiro(self, local: str, visitante: str) -> dict:
         if not self.api_key:
@@ -89,9 +119,12 @@ class Orquestador:
         mercados_bzz = {}
         mejor_marcador = ""
         mejor_prob = 0.0
+        hora_partido = ""
 
         if "success" in res:
             fuente = "BZZOIRO"
+            ev_data = res["data"].get("event", {})
+            hora_partido = self._extraer_hora(ev_data)
             mkts = res["data"].get("markets", {})
             
             mr = mkts.get("match_result", {})
@@ -120,15 +153,6 @@ class Orquestador:
                     mejor_marcador = max(score_mkt, key=score_mkt.get)
                     mejor_prob = float(score_mkt[mejor_marcador]) / 100.0
                 except: pass
-
-            corners = mkts.get("corners", {})
-            if corners:
-                mercados_bzz["corners_over_85"] = float(corners.get("prob_over_85", 0)) / 100.0
-                mercados_bzz["corners_over_95"] = float(corners.get("prob_over_95", 0)) / 100.0
-            cards = mkts.get("cards", {})
-            if cards:
-                mercados_bzz["cards_over_35"] = float(cards.get("prob_over_35", 0)) / 100.0
-                mercados_bzz["cards_over_45"] = float(cards.get("prob_over_45", 0)) / 100.0
 
         else:
             fuente = f"ERROR: {res.get('error', 'Desconocido')[:40]}"
@@ -172,10 +196,6 @@ class Orquestador:
             "hcp_local_m05": p_local_menos_05,
             "hcp_local_m15": p_local_menos_15,
             "hcp_visita_p05": p_visita_mas_05,
-            "corners_over_85": mercados_bzz.get("corners_over_85", 0.5),
-            "corners_over_95": mercados_bzz.get("corners_over_95", 0.5),
-            "cards_over_35": mercados_bzz.get("cards_over_35", 0.5),
-            "cards_over_45": mercados_bzz.get("cards_over_45", 0.5),
         }
 
         if not mejor_marcador:
@@ -190,30 +210,8 @@ class Orquestador:
         confianza = "alta" if max_prob > 0.55 else ("media" if max_prob > 0.45 else "baja")
 
         return RespuestaPronostico(
-            local=consulta.local, visitante=consulta.visitante,
+            local=consulta.local, visitante=consulta.visitante, hora=hora_partido,
             probabilidades=probs_final, mercados=mercados,
             confianza=confianza, marcador_top=mejor_marcador,
             marcador_prob=mejor_prob, fuente=fuente,
         )
-
-    async def obtener_partidos_disponibles(self, limite: int = 10) -> list:
-        """Obtiene la lista de partidos disponibles en Bzzoiro para mostrarlos como botones."""
-        if not self.api_key:
-            return []
-        headers = {"Authorization": f"Token {self.api_key}", "User-Agent": "Mozilla/5.0"}
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as c:
-                r = await c.get(f"{BASE_URL}/predictions/", headers=headers, params={"limit": limite})
-                if r.status_code == 200:
-                    data = r.json()
-                    partidos = []
-                    for item in data.get("results", []):
-                        ev = item.get("event", {})
-                        h = ev.get("home_team", "")
-                        a = ev.get("away_team", "")
-                        if h and a:
-                            partidos.append(f"{h} vs {a}")
-                    return partidos
-        except Exception as e:
-            logger.error(f"Error obteniendo partidos: {e}")
-        return []

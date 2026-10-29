@@ -1,4 +1,4 @@
-"""Bot de Telegram con comando /hoy y botones interactivos."""
+"""Bot de Telegram con comando /hoy y botones interactivos con hora."""
 from __future__ import annotations
 import logging
 import os
@@ -30,7 +30,9 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     for i, p in enumerate(partidos):
-        keyboard.append([InlineKeyboardButton(p, callback_data=f"an_{i}")])
+        # Agregar el reloj y la hora si está disponible
+        boton_texto = f"⏰ {p['hora']} | {p['texto']}" if p['hora'] else p['texto']
+        keyboard.append([InlineKeyboardButton(boton_texto, callback_data=f"an_{i}")])
 
     context.user_data['partidos_hoy'] = partidos
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -51,7 +53,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         partidos = context.user_data.get('partidos_hoy', [])
         
         if idx < len(partidos):
-            texto = partidos[idx]
+            texto = partidos[idx]['texto']
             await query.message.reply_text(f"🔍 Analizando <b>{texto}</b>...", parse_mode="HTML")
             
             try:
@@ -59,7 +61,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p = r.probabilidades
                 m = r.mercados
                 
-                # Crear Top Picks
                 picks = [
                     ("Ganador Local", p.get('local', 0)), ("Ganador Empate", p.get('empate', 0)), ("Ganador Visita", p.get('visitante', 0)),
                     ("Doble Oportunidad 1X", m.get('doble_1x', 0)), ("Doble Oportunidad 12", m.get('doble_12', 0)), ("Doble Oportunidad X2", m.get('doble_x2', 0)),
@@ -70,6 +71,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 picks.sort(key=lambda x: x[1], reverse=True)
                 top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
+                hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
+                
                 cuadro = f"""
 ┌─────────────────────────────────┐
 │ ⚽ {r.local} vs {r.visitante}
@@ -100,7 +103,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 └─────────────────────────────────┘
 """
                 mensaje = (
-                    f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n\n"
+                    f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n"
+                    f"{hora_str}\n"
                     f"🔥 <b>TOP PICKS:</b>\n{top_texto}\n"
                     f"📊 <b>Desglose:</b>\n<pre>{cuadro}</pre>\n"
                     f"🎯 Confianza: <b>{r.confianza.upper()}</b>"
@@ -120,6 +124,7 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r = await orquestador.procesar(texto, guardar=True)
         p = r.probabilidades
         m = r.mercados
+        
         picks = [
             ("Ganador Local", p.get('local', 0)), ("Ganador Empate", p.get('empate', 0)), ("Ganador Visita", p.get('visitante', 0)),
             ("Doble Oportunidad 1X", m.get('doble_1x', 0)), ("Doble Oportunidad 12", m.get('doble_12', 0)), ("Doble Oportunidad X2", m.get('doble_x2', 0)),
@@ -129,6 +134,8 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         picks.sort(key=lambda x: x[1], reverse=True)
         top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
+
+        hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
 
         cuadro = f"""
 ┌─────────────────────────────────┐
@@ -160,7 +167,8 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 └─────────────────────────────────┘
 """
         mensaje = (
-            f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n\n"
+            f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n"
+            f"{hora_str}\n"
             f"🔥 <b>TOP PICKS:</b>\n{top_texto}\n"
             f"📊 <b>Desglose:</b>\n<pre>{cuadro}</pre>\n"
             f"🎯 Confianza: <b>{r.confianza.upper()}</b>"
