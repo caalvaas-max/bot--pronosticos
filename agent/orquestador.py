@@ -1,4 +1,4 @@
-"""Orquestador Definitivo: Hándicap exacto, marcador dinámico y escáner de hora."""
+"""Orquestador Definitivo con Handicap exacto y Marcador blindado."""
 from __future__ import annotations
 import logging
 import os
@@ -45,21 +45,12 @@ class Orquestador:
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
 
     def _extraer_hora(self, ev: dict) -> str:
-        # Escáner de hora: busca cualquier cosa que parezca una hora (HH:MM)
-        for key, val in ev.items():
-            if isinstance(val, str) and "T" in val and len(val) >= 16:
-                # Busca formato 2026-10-28T20:00:00Z
+        for key in ["start_time", "date", "time", "kickoff", "kickoff_utc"]:
+            val = ev.get(key)
+            if val and isinstance(val, str) and "T" in val:
                 try: return val[11:16]
                 except: pass
-            elif isinstance(val, str) and ":" in val and len(val) <= 5:
-                # Busca formato 20:00
-                return val
-            elif isinstance(val, int) and val > 1600000000:
-                # Busca formato timestamp UNIX
-                import datetime
-                try: return datetime.datetime.fromtimestamp(val).strftime("%H:%M")
-                except: pass
-        return ""
+        return "No disponible"
 
     async def obtener_partidos_disponibles(self, limite: int = 8) -> list:
         if not self.api_key: return []
@@ -113,9 +104,9 @@ class Orquestador:
         fuente = "APROX"
         probs_final = {}
         mercados_bzz = {}
-        mejor_marcador = ""
+        mejor_marcador = "No disponible"
         mejor_prob = 0.0
-        hora_partido = ""
+        hora_partido = "No disponible"
 
         if "success" in res:
             fuente = "BZZOIRO"
@@ -123,7 +114,6 @@ class Orquestador:
             hora_partido = self._extraer_hora(ev_data)
             mkts = res["data"].get("markets", {})
             
-            # 1X2
             mr = mkts.get("match_result", {})
             if mr:
                 probs_final = {
@@ -132,7 +122,6 @@ class Orquestador:
                     "visitante": float(mr.get("prob_away", 0)) / 100.0
                 }
             
-            # Goles y BTTS
             ou = mkts.get("over_under", {})
             if ou:
                 mercados_bzz["over_15"] = float(ou.get("prob_over_15", 0)) / 100.0
@@ -145,22 +134,21 @@ class Orquestador:
                 mercados_bzz["btts_si"] = prob_yes
                 mercados_bzz["btts_no"] = 1.0 - prob_yes
             
-            # Escáner de Marcador Top (Buscando llaves con "prob" o formato "1-1")
+            # MARCADOR BLINDADO
             score_mkt = mkts.get("score", {})
-            for k, v in score_mkt.items():
-                if k == "most_likely":
-                    if isinstance(v, str) and "-" in v:
-                        mejor_marcador = v
-                        # Buscar su probabilidad en otra llave si existe
-                        mejor_prob = float(score_mkt.get(f"prob_{v.replace('-','_')}", 0)) / 100.0
-                elif "-" in str(k):
-                    # Si la llave es "1-1"
-                    if float(v) > mejor_prob * 100:
-                        mejor_marcador = k
-                        mejor_prob = float(v) / 100.0
-            
-            if not mejor_marcador and "most_likely" in score_mkt:
-                 mejor_marcador = str(score_mkt["most_likely"])
+            if score_mkt:
+                if "most_likely" in score_mkt and isinstance(score_mkt["most_likely"], str):
+                    marcador_raw = score_mkt["most_likely"]
+                    if "-" in marcador_raw:
+                        mejor_marcador = marcador_raw
+                        prob_key = f"prob_{marcador_raw.replace('-', '_')}"
+                        mejor_prob = float(score_mkt.get(prob_key, 0)) / 100.0
+                else:
+                    for k, v in score_mkt.items():
+                        if "-" in str(k):
+                            if float(v) > mejor_prob * 100:
+                                mejor_marcador = k
+                                mejor_prob = float(v) / 100.0
 
         else:
             fuente = f"ERROR: {res.get('error', 'Desconocido')[:40]}"
@@ -168,13 +156,12 @@ class Orquestador:
         if not probs_final:
             probs_final = {"local": 0.33, "empate": 0.33, "visitante": 0.34}
 
-        # --- HÁNDICAP EXACTO MATEMÁTICAMENTE ---
-        # El hándicap Loc -0.5 significa exactamente lo mismo que gana el local.
+        # --- HÁNDICAP FORZADO A LAS PROBABILIDADES REALES ---
+        # Esto garantiza que Loc -0.5 sea SIEMPRE igual a la prob del Local
         hcp_local_m05 = probs_final.get("local", 0)
-        # El hándicap Vis +0.5 significa que gana la visita o empatan.
         hcp_visita_p05 = probs_final.get("empate", 0) + probs_final.get("visitante", 0)
         
-        # Para Loc -1.5 (ganar por 2 goles o más), usamos la matriz completa (8x8) sin truncar
+        # Para Loc -1.5 usamos Poisson
         lambda_local = 1.4 * (probs_final.get("local", 0.33) / 0.33)
         lambda_visitante = 1.1 * (probs_final.get("visitante", 0.33) / 0.33)
         matriz = self.poisson.calcular_matriz(lambda_local, lambda_visitante)
