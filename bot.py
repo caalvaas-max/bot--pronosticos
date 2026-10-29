@@ -12,11 +12,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 orquestador = Orquestador(bankroll=1000.0)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 <b>Bot de Pronosticos</b>\n\n"
-        "Escribe <code>/hoy</code> para ver los partidos.",
-        parse_mode="HTML"
-    )
+    await update.message.reply_text("🤖 <b>Bot de Pronosticos</b>\n\nEscribe <code>/hoy</code> para ver los partidos.", parse_mode="HTML")
 
 async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Buscando partidos disponibles en Bzzoiro...")
@@ -34,11 +30,7 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['partidos_hoy'] = partidos
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
-        "⚽ <b>Selecciona un partido para analizar:</b>", 
-        reply_markup=reply_markup, 
-        parse_mode="HTML"
-    )
+    await update.message.reply_text("⚽ <b>Selecciona un partido para analizar:</b>", reply_markup=reply_markup, parse_mode="HTML")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -70,7 +62,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
                 
-                marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)" if r.marcador_top else "No disponible"
+                # Formatear marcador
+                if r.marcador_top and r.marcador_top != "most_likely":
+                    marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
+                else:
+                    marcador_str = "No disponible"
                 
                 cuadro = f"""
 ┌─────────────────────────────────┐
@@ -135,7 +131,10 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
         hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
-        marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)" if r.marcador_top else "No disponible"
+        if r.marcador_top and r.marcador_top != "most_likely":
+            marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
+        else:
+            marcador_str = "No disponible"
 
         cuadro = f"""
 ┌─────────────────────────────────┐

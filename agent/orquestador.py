@@ -1,4 +1,4 @@
-"""Orquestador con correcciones de hora, marcador y handicap dinamico."""
+"""Orquestador Definitivo: Hándicap exacto, marcador dinámico y escáner de hora."""
 from __future__ import annotations
 import logging
 import os
@@ -45,19 +45,24 @@ class Orquestador:
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
 
     def _extraer_hora(self, ev: dict) -> str:
-        # Buscar en todas las posibles llaves que usa la API
-        for key in ["start_time", "time", "date", "kickoff", "fixture_date"]:
-            val = ev.get(key)
-            if val and isinstance(val, str):
-                # Si es formato ISO (2026-10-28T20:00:00Z), extraer HH:MM
-                if "T" in val and len(val) >= 16:
-                    return val[11:16]
+        # Escáner de hora: busca cualquier cosa que parezca una hora (HH:MM)
+        for key, val in ev.items():
+            if isinstance(val, str) and "T" in val and len(val) >= 16:
+                # Busca formato 2026-10-28T20:00:00Z
+                try: return val[11:16]
+                except: pass
+            elif isinstance(val, str) and ":" in val and len(val) <= 5:
+                # Busca formato 20:00
                 return val
+            elif isinstance(val, int) and val > 1600000000:
+                # Busca formato timestamp UNIX
+                import datetime
+                try: return datetime.datetime.fromtimestamp(val).strftime("%H:%M")
+                except: pass
         return ""
 
     async def obtener_partidos_disponibles(self, limite: int = 8) -> list:
-        if not self.api_key:
-            return []
+        if not self.api_key: return []
         headers = {"Authorization": f"Token {self.api_key}", "User-Agent": "Mozilla/5.0"}
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
@@ -78,36 +83,26 @@ class Orquestador:
         return []
 
     async def _consultar_bzzoiro(self, local: str, visitante: str) -> dict:
-        if not self.api_key:
-            return {"error": "BZZOIRO_API_KEY vacia"}
-            
+        if not self.api_key: return {"error": "BZZOIRO_API_KEY vacia"}
         headers = {"Authorization": f"Token {self.api_key}", "User-Agent": "Mozilla/5.0"}
         loc_norm = normalizar(local)
         vis_norm = normalizar(visitante)
-        
         try:
             async with httpx.AsyncClient(timeout=20.0) as c:
                 for offset in range(0, 250, 50):
                     r = await c.get(f"{BASE_URL}/predictions/", headers=headers, params={"limit": 50, "offset": offset})
-                    if r.status_code != 200:
-                        return {"error": f"API Status {r.status_code}"}
-                    
+                    if r.status_code != 200: return {"error": f"API Status {r.status_code}"}
                     data = r.json()
                     results = data.get("results", [])
-                    if not results:
-                        break
-                    
+                    if not results: break
                     for item in results:
                         ev = item.get("event", {})
                         h_name = str(ev.get("home_team", ""))
                         a_name = str(ev.get("away_team", ""))
-                        
                         if (loc_norm in normalizar(h_name) or normalizar(h_name) in loc_norm) and \
                            (vis_norm in normalizar(a_name) or normalizar(a_name) in vis_norm):
                             return {"success": True, "data": item}
-                            
                 return {"error": "No se encontró el partido."}
-                    
         except Exception as e:
             return {"error": f"Falla: {str(e)[:30]}"}
 
@@ -128,6 +123,7 @@ class Orquestador:
             hora_partido = self._extraer_hora(ev_data)
             mkts = res["data"].get("markets", {})
             
+            # 1X2
             mr = mkts.get("match_result", {})
             if mr:
                 probs_final = {
@@ -136,6 +132,7 @@ class Orquestador:
                     "visitante": float(mr.get("prob_away", 0)) / 100.0
                 }
             
+            # Goles y BTTS
             ou = mkts.get("over_under", {})
             if ou:
                 mercados_bzz["over_15"] = float(ou.get("prob_over_15", 0)) / 100.0
@@ -148,16 +145,22 @@ class Orquestador:
                 mercados_bzz["btts_si"] = prob_yes
                 mercados_bzz["btts_no"] = 1.0 - prob_yes
             
-            # Corrección del marcador: ignorar "most_likely"
+            # Escáner de Marcador Top (Buscando llaves con "prob" o formato "1-1")
             score_mkt = mkts.get("score", {})
-            if score_mkt:
-                for k, v in score_mkt.items():
-                    if k != "most_likely" and float(v) > 0:
-                        try:
-                            mejor_marcador = k
-                            mejor_prob = float(v) / 100.0
-                            break
-                        except: pass
+            for k, v in score_mkt.items():
+                if k == "most_likely":
+                    if isinstance(v, str) and "-" in v:
+                        mejor_marcador = v
+                        # Buscar su probabilidad en otra llave si existe
+                        mejor_prob = float(score_mkt.get(f"prob_{v.replace('-','_')}", 0)) / 100.0
+                elif "-" in str(k):
+                    # Si la llave es "1-1"
+                    if float(v) > mejor_prob * 100:
+                        mejor_marcador = k
+                        mejor_prob = float(v) / 100.0
+            
+            if not mejor_marcador and "most_likely" in score_mkt:
+                 mejor_marcador = str(score_mkt["most_likely"])
 
         else:
             fuente = f"ERROR: {res.get('error', 'Desconocido')[:40]}"
@@ -165,27 +168,17 @@ class Orquestador:
         if not probs_final:
             probs_final = {"local": 0.33, "empate": 0.33, "visitante": 0.34}
 
-        # --- CÁLCULO DINÁMICO DE HÁNDICAP Y GOLES ---
-        # Si Bzzoiro nos dio probs, deducimos los lambdas para que la matriz sea única
-        # Una aproximación rápida: si el local es favorito, su lambda sube.
-        factor_local = probs_final["local"] / 0.33
-        factor_visitante = probs_final["visitante"] / 0.33
+        # --- HÁNDICAP EXACTO MATEMÁTICAMENTE ---
+        # El hándicap Loc -0.5 significa exactamente lo mismo que gana el local.
+        hcp_local_m05 = probs_final.get("local", 0)
+        # El hándicap Vis +0.5 significa que gana la visita o empatan.
+        hcp_visita_p05 = probs_final.get("empate", 0) + probs_final.get("visitante", 0)
         
-        lambda_local_dinamico = 1.4 * factor_local
-        lambda_visitante_dinamico = 1.1 * factor_visitante
-        
-        # Si Over 2.5 es alto, subimos ambos lambdas
-        if "over_25" in mercados_bzz:
-            if mercados_bzz["over_25"] > 0.55:
-                lambda_local_dinamico *= 1.2
-                lambda_visitante_dinamico *= 1.2
-                
-        matriz = self.poisson.calcular_matriz(lambda_local_dinamico, lambda_visitante_dinamico)
-        
-        # Hándicap Asiático Dinámico
-        p_local_menos_05 = sum(matriz[i, j] for i in range(6) for j in range(6) if i > j)
-        p_local_menos_15 = sum(matriz[i, j] for i in range(6) for j in range(6) if i - j >= 2)
-        p_visita_mas_05 = sum(matriz[i, j] for i in range(6) for j in range(6) if j > i or i == j)
+        # Para Loc -1.5 (ganar por 2 goles o más), usamos la matriz completa (8x8) sin truncar
+        lambda_local = 1.4 * (probs_final.get("local", 0.33) / 0.33)
+        lambda_visitante = 1.1 * (probs_final.get("visitante", 0.33) / 0.33)
+        matriz = self.poisson.calcular_matriz(lambda_local, lambda_visitante)
+        hcp_local_m15 = sum(matriz[i, j] for i in range(matriz.shape[0]) for j in range(matriz.shape[1]) if i - j >= 2)
 
         doble_1x = probs_final.get("local", 0) + probs_final.get("empate", 0)
         doble_12 = probs_final.get("local", 0) + probs_final.get("visitante", 0)
@@ -200,9 +193,9 @@ class Orquestador:
             "doble_1x": doble_1x,
             "doble_12": doble_12,
             "doble_x2": doble_x2,
-            "hcp_local_m05": p_local_menos_05,
-            "hcp_local_m15": p_local_menos_15,
-            "hcp_visita_p05": p_visita_mas_05,
+            "hcp_local_m05": hcp_local_m05,
+            "hcp_local_m15": hcp_local_m15,
+            "hcp_visita_p05": hcp_visita_p05,
         }
 
         max_prob = max(probs_final.values())
