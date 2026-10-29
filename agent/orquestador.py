@@ -195,3 +195,25 @@ class Orquestador:
             confianza=confianza, marcador_top=mejor_marcador,
             marcador_prob=mejor_prob, fuente=fuente,
         )
+
+    async def obtener_partidos_disponibles(self, limite: int = 10) -> list:
+        """Obtiene la lista de partidos disponibles en Bzzoiro para mostrarlos como botones."""
+        if not self.api_key:
+            return []
+        headers = {"Authorization": f"Token {self.api_key}", "User-Agent": "Mozilla/5.0"}
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as c:
+                r = await c.get(f"{BASE_URL}/predictions/", headers=headers, params={"limit": limite})
+                if r.status_code == 200:
+                    data = r.json()
+                    partidos = []
+                    for item in data.get("results", []):
+                        ev = item.get("event", {})
+                        h = ev.get("home_team", "")
+                        a = ev.get("away_team", "")
+                        if h and a:
+                            partidos.append(f"{h} vs {a}")
+                    return partidos
+        except Exception as e:
+            logger.error(f"Error obteniendo partidos: {e}")
+        return []
