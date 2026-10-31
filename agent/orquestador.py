@@ -1,4 +1,4 @@
-"""Orquestador Definitivo con Handicap exacto y Marcador blindado."""
+"""Orquestador Definitivo con Hora Real y Marcador Limpio."""
 from __future__ import annotations
 import logging
 import os
@@ -45,14 +45,18 @@ class Orquestador:
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
 
     def _extraer_hora(self, ev: dict) -> str:
-        for key in ["start_time", "date", "time", "kickoff", "kickoff_utc"]:
-            val = ev.get(key)
-            if val and isinstance(val, str) and "T" in val:
-                try: return val[11:16]
-                except: pass
+        # ¡AQUÍ ESTÁ LA LLAVE CORRECTA!
+        val = ev.get("event_date")
+        if val and isinstance(val, str):
+            try:
+                # Formato ISO 2026-10-30T15:00:00Z -> Extraer 15:00
+                if "T" in val:
+                    return val[11:16]
+                return val
+            except: pass
         return "No disponible"
 
-    async def obtener_partidos_disponibles(self, limite: int = 8) -> list:
+    async def obtener_partidos_disponibles(self, limite: int = 20) -> list:
         if not self.api_key: return []
         headers = {"Authorization": f"Token {self.api_key}", "User-Agent": "Mozilla/5.0"}
         try:
@@ -104,7 +108,7 @@ class Orquestador:
         fuente = "APROX"
         probs_final = {}
         mercados_bzz = {}
-        mejor_marcador = "No disponible"
+        mejor_marcador = ""
         mejor_prob = 0.0
         hora_partido = "No disponible"
 
@@ -134,15 +138,12 @@ class Orquestador:
                 mercados_bzz["btts_si"] = prob_yes
                 mercados_bzz["btts_no"] = 1.0 - prob_yes
             
-            # MARCADOR BLINDADO
+            # Marcador Top Limpio
             score_mkt = mkts.get("score", {})
             if score_mkt:
-                if "most_likely" in score_mkt and isinstance(score_mkt["most_likely"], str):
-                    marcador_raw = score_mkt["most_likely"]
-                    if "-" in marcador_raw:
-                        mejor_marcador = marcador_raw
-                        prob_key = f"prob_{marcador_raw.replace('-', '_')}"
-                        mejor_prob = float(score_mkt.get(prob_key, 0)) / 100.0
+                if "most_likely" in score_mkt:
+                    mejor_marcador = str(score_mkt["most_likely"])
+                    mejor_prob = 0.0 # No hay porcentaje disponible en la API
                 else:
                     for k, v in score_mkt.items():
                         if "-" in str(k):
@@ -156,12 +157,9 @@ class Orquestador:
         if not probs_final:
             probs_final = {"local": 0.33, "empate": 0.33, "visitante": 0.34}
 
-        # --- HÁNDICAP FORZADO A LAS PROBABILIDADES REALES ---
-        # Esto garantiza que Loc -0.5 sea SIEMPRE igual a la prob del Local
         hcp_local_m05 = probs_final.get("local", 0)
         hcp_visita_p05 = probs_final.get("empate", 0) + probs_final.get("visitante", 0)
         
-        # Para Loc -1.5 usamos Poisson
         lambda_local = 1.4 * (probs_final.get("local", 0.33) / 0.33)
         lambda_visitante = 1.1 * (probs_final.get("visitante", 0.33) / 0.33)
         matriz = self.poisson.calcular_matriz(lambda_local, lambda_visitante)

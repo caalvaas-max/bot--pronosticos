@@ -16,7 +16,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Buscando partidos disponibles en Bzzoiro...")
-    partidos = await orquestador.obtener_partidos_disponibles(limite=8)
+    partidos = await orquestador.obtener_partidos_disponibles(limite=20) 
     
     if not partidos:
         await update.message.reply_text("❌ No hay partidos disponibles en este momento.")
@@ -24,7 +24,7 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     for i, p in enumerate(partidos):
-        boton_texto = f"⏰ {p['hora']} | {p['texto']}" if p['hora'] else p['texto']
+        boton_texto = f"⏰ {p['hora']} | {p['texto']}" if p['hora'] != "No disponible" else p['texto']
         keyboard.append([InlineKeyboardButton(boton_texto, callback_data=f"an_{i}")])
 
     context.user_data['partidos_hoy'] = partidos
@@ -60,11 +60,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 picks.sort(key=lambda x: x[1], reverse=True)
                 top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
-                hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
+                hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora != "No disponible" else ""
                 
-                # Formatear marcador
-                if r.marcador_top and r.marcador_top != "most_likely":
-                    marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
+                # FORMATEO LIMPIO DEL MARCADOR
+                if r.marcador_top and r.marcador_top not in ["most_likely", "No disponible"]:
+                    if r.marcador_prob > 0:
+                        marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
+                    else:
+                        marcador_str = r.marcador_top
                 else:
                     marcador_str = "No disponible"
                 
@@ -130,9 +133,13 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         picks.sort(key=lambda x: x[1], reverse=True)
         top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
-        hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
-        if r.marcador_top and r.marcador_top != "most_likely":
-            marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
+        hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora != "No disponible" else ""
+        
+        if r.marcador_top and r.marcador_top not in ["most_likely", "No disponible"]:
+            if r.marcador_prob > 0:
+                marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
+            else:
+                marcador_str = r.marcador_top
         else:
             marcador_str = "No disponible"
 
@@ -186,4 +193,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# Actualizacion final Thu Oct 29 05:00:39 UTC 2026
