@@ -1,4 +1,4 @@
-"""Bot de Telegram con comando /hoy y botones interactivos."""
+"""Bot de Telegram final."""
 from __future__ import annotations
 import logging
 import os
@@ -62,13 +62,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
                 
-                if r.marcador_top and r.marcador_top not in ["most_likely", "No disponible"]:
-                    if r.marcador_prob > 0:
-                        marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
-                    else:
-                        marcador_str = r.marcador_top
-                else:
-                    marcador_str = "No disponible"
+                # FORMATEO BLINDADO DEL MARCADOR
+                marcador_str = str(r.marcador_top) if r.marcador_top else "No disponible"
+                if r.marcador_prob > 0:
+                    marcador_str += f" ({r.marcador_prob*100:.1f}%)"
                 
                 cuadro = f"""
 ┌─────────────────────────────────┐
@@ -134,13 +131,9 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
         
-        if r.marcador_top and r.marcador_top not in ["most_likely", "No disponible"]:
-            if r.marcador_prob > 0:
-                marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
-            else:
-                marcador_str = r.marcador_top
-        else:
-            marcador_str = "No disponible"
+        marcador_str = str(r.marcador_top) if r.marcador_top else "No disponible"
+        if r.marcador_prob > 0:
+            marcador_str += f" ({r.marcador_prob*100:.1f}%)"
 
         cuadro = f"""
 ┌─────────────────────────────────┐

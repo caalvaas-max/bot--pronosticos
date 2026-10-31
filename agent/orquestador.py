@@ -1,4 +1,4 @@
-"""Orquestador Definitivo con Hora Real y Marcador Limpio."""
+"""Orquestador Definitivo con Búsqueda Agresiva de Hora."""
 from __future__ import annotations
 import logging
 import os
@@ -46,19 +46,18 @@ class Orquestador:
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
 
     def _extraer_hora(self, ev: dict) -> str:
-        val = ev.get("event_date")
-        if val:
-            try:
-                # Si es un timestamp (número)
-                if isinstance(val, (int, float)):
-                    return datetime.datetime.fromtimestamp(val).strftime("%H:%M")
-                # Si es string ISO (2026-10-30T15:00:00Z)
-                elif isinstance(val, str) and "T" in val:
-                    return val[11:16]
-                # Si es string con formato (15:00:00)
-                elif isinstance(val, str) and ":" in val:
-                    return val[:5]
-            except: pass
+        # Busca cualquier llave que tenga "date" o "time"
+        for key, val in ev.items():
+            if "date" in key.lower() or "time" in key.lower():
+                if val:
+                    try:
+                        if isinstance(val, (int, float)):
+                            return datetime.datetime.fromtimestamp(val).strftime("%H:%M")
+                        elif isinstance(val, str) and "T" in val:
+                            return val[11:16]
+                        elif isinstance(val, str) and ":" in val:
+                            return val[:5]
+                    except: pass
         return ""
 
     async def obtener_partidos_disponibles(self, limite: int = 20) -> list:
@@ -147,7 +146,6 @@ class Orquestador:
             if score_mkt:
                 if "most_likely" in score_mkt:
                     mejor_marcador = str(score_mkt["most_likely"])
-                    mejor_prob = 0.0
                 else:
                     for k, v in score_mkt.items():
                         if "-" in str(k):
