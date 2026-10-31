@@ -1,4 +1,4 @@
-"""Bot de Telegram final."""
+"""Bot de Telegram Final - Cuadro Limpio sin Datos Vacíos."""
 from __future__ import annotations
 import logging
 import os
@@ -60,13 +60,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 picks.sort(key=lambda x: x[1], reverse=True)
                 top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
-                hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
-                
-                # FORMATEO BLINDADO DEL MARCADOR
-                marcador_str = str(r.marcador_top) if r.marcador_top else "No disponible"
-                if r.marcador_prob > 0:
-                    marcador_str += f" ({r.marcador_prob*100:.1f}%)"
-                
+                # ELIMINAMOS LA HORA Y EL MARCADOR DEL CUADRO
                 cuadro = f"""
 ┌─────────────────────────────────┐
 │ ⚽ {r.local} vs {r.visitante}
@@ -92,13 +86,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ├─────────────────────────────────┤
 │ Ambos Anotan   │ Si        │ {m.get('btts_si',0)*100:.1f}%
 │ Ambos Anotan   │ No        │ {m.get('btts_no',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Marcador Top   │ {marcador_str[:20]} │
 └─────────────────────────────────┘
 """
                 mensaje = (
-                    f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n"
-                    f"{hora_str}\n"
+                    f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n\n"
                     f"🔥 <b>TOP PICKS:</b>\n{top_texto}\n"
                     f"📊 <b>Desglose:</b>\n<pre>{cuadro}</pre>\n"
                     f"🎯 Confianza: <b>{r.confianza.upper()}</b>"
@@ -129,12 +120,6 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         picks.sort(key=lambda x: x[1], reverse=True)
         top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
-        hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
-        
-        marcador_str = str(r.marcador_top) if r.marcador_top else "No disponible"
-        if r.marcador_prob > 0:
-            marcador_str += f" ({r.marcador_prob*100:.1f}%)"
-
         cuadro = f"""
 ┌─────────────────────────────────┐
 │ ⚽ {r.local} vs {r.visitante}
@@ -160,13 +145,10 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ├─────────────────────────────────┤
 │ Ambos Anotan   │ Si        │ {m.get('btts_si',0)*100:.1f}%
 │ Ambos Anotan   │ No        │ {m.get('btts_no',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Marcador Top   │ {marcador_str[:20]} │
 └─────────────────────────────────┘
 """
         mensaje = (
-            f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n"
-            f"{hora_str}\n"
+            f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n\n"
             f"🔥 <b>TOP PICKS:</b>\n{top_texto}\n"
             f"📊 <b>Desglose:</b>\n<pre>{cuadro}</pre>\n"
             f"🎯 Confianza: <b>{r.confianza.upper()}</b>"
@@ -185,5 +167,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# fix visual
-# update
