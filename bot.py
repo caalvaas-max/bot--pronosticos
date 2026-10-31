@@ -1,4 +1,4 @@
-"""Bot de Telegram con comando /hoy y botones interactivos con hora."""
+"""Bot de Telegram con comando /hoy y botones interactivos."""
 from __future__ import annotations
 import logging
 import os
@@ -24,7 +24,7 @@ async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     for i, p in enumerate(partidos):
-        boton_texto = f"⏰ {p['hora']} | {p['texto']}" if p['hora'] != "No disponible" else p['texto']
+        boton_texto = f"⏰ {p['hora']} | {p['texto']}" if p['hora'] else p['texto']
         keyboard.append([InlineKeyboardButton(boton_texto, callback_data=f"an_{i}")])
 
     context.user_data['partidos_hoy'] = partidos
@@ -60,9 +60,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 picks.sort(key=lambda x: x[1], reverse=True)
                 top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
-                hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora != "No disponible" else ""
+                hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
                 
-                # FORMATEO LIMPIO DEL MARCADOR
                 if r.marcador_top and r.marcador_top not in ["most_likely", "No disponible"]:
                     if r.marcador_prob > 0:
                         marcador_str = f"{r.marcador_top} ({r.marcador_prob*100:.1f}%)"
@@ -133,7 +132,7 @@ async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         picks.sort(key=lambda x: x[1], reverse=True)
         top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
 
-        hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora != "No disponible" else ""
+        hora_str = f"⏰ Hora del partido: <b>{r.hora}</b>\n" if r.hora else ""
         
         if r.marcador_top and r.marcador_top not in ["most_likely", "No disponible"]:
             if r.marcador_prob > 0:

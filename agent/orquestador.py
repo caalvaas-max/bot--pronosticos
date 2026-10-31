@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import unicodedata
+import datetime
 from dataclasses import dataclass, field
 from typing import Optional
 import httpx
@@ -45,16 +46,20 @@ class Orquestador:
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
 
     def _extraer_hora(self, ev: dict) -> str:
-        # ¡AQUÍ ESTÁ LA LLAVE CORRECTA!
         val = ev.get("event_date")
-        if val and isinstance(val, str):
+        if val:
             try:
-                # Formato ISO 2026-10-30T15:00:00Z -> Extraer 15:00
-                if "T" in val:
+                # Si es un timestamp (número)
+                if isinstance(val, (int, float)):
+                    return datetime.datetime.fromtimestamp(val).strftime("%H:%M")
+                # Si es string ISO (2026-10-30T15:00:00Z)
+                elif isinstance(val, str) and "T" in val:
                     return val[11:16]
-                return val
+                # Si es string con formato (15:00:00)
+                elif isinstance(val, str) and ":" in val:
+                    return val[:5]
             except: pass
-        return "No disponible"
+        return ""
 
     async def obtener_partidos_disponibles(self, limite: int = 20) -> list:
         if not self.api_key: return []
@@ -110,7 +115,7 @@ class Orquestador:
         mercados_bzz = {}
         mejor_marcador = ""
         mejor_prob = 0.0
-        hora_partido = "No disponible"
+        hora_partido = ""
 
         if "success" in res:
             fuente = "BZZOIRO"
@@ -138,12 +143,11 @@ class Orquestador:
                 mercados_bzz["btts_si"] = prob_yes
                 mercados_bzz["btts_no"] = 1.0 - prob_yes
             
-            # Marcador Top Limpio
             score_mkt = mkts.get("score", {})
             if score_mkt:
                 if "most_likely" in score_mkt:
                     mejor_marcador = str(score_mkt["most_likely"])
-                    mejor_prob = 0.0 # No hay porcentaje disponible en la API
+                    mejor_prob = 0.0
                 else:
                     for k, v in score_mkt.items():
                         if "-" in str(k):
