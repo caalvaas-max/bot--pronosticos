@@ -1,0 +1,2531 @@
+===== ./agent/__init__.py =====
+===== ./agent/orquestador.py =====
+"""Orquestador principal con datos reales de Bzzoiro."""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass, field
+
+from agent.validacion import validar_texto, ValidacionError
+from models.poisson_bivariante import PoissonBivariante
+from models.goles import calcular_lambda
+from models.pi_ratings import PiRatings
+from models.ensemble import combinar_1x2
+from data.bzzoiro_client import BzzoiroClient
+from auditoria.guardar import GuardadorPronosticos, DatosPronostico
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RespuestaPronostico:
+    local: str
+    visitante: str
+    probabilidades: dict
+    mercados: dict = field(default_factory=dict)
+    confianza: str = "media"
+    marcador_top: str = ""
+    marcador_prob: float = 0.0
+    datos_reales: bool = False
+    fuente: str = "APROX"
+
+
+class Orquestador:
+    def __init__(self, bankroll: float = 1000.0):
+        self.poisson = PoissonBivariante()
+        self.pi_ratings = PiRatings()
+        self.bzzoiro = BzzoiroClient()
+        self.guardador = GuardadorPronosticos()
+
+    async def procesar(self, texto: str, guardar: bool = True) -> RespuestaPronostico:
+        consulta = validar_texto(texto)
+        logger.info(f"Procesando: {consulta.local} vs {consulta.visitante}")
+
+        probs_mercado = None
+        datos_reales = False
+        fuente = "APROX"
+
+        try:
+            partido = await self.bzzoiro.buscar_partido(
+                consulta.local, consulta.visitante
+            )
+            if partido:
+                evento_id = partido.get("id")
+                logger.info(f"Partido encontrado: {evento_id}")
+
+                probs_mercado = await self.bzzoiro.probabilidades_mercado(evento_id)
+                if probs_mercado:
+                    datos_reales = True
+                    fuente = "REAL (Bzzoiro)"
+                    logger.info(f"Probabilidades mercado: {probs_mercado}")
+        except Exception as e:
+            logger.warning(f"Bzzoiro no disponible: {e}")
+
+        # Si tenemos probabilidades del mercado, usarlas como base
+        if probs_mercado:
+            probs_final = probs_mercado
+        else:
+            goles = calcular_lambda(1.5, 1.5, 1.2, 1.2)
+            p1x2 = self.poisson.calcular_1x2(goles.lambda_local, goles.lambda_visitante)
+            prob_poisson_dict = {
+                "local": p1x2.local,
+                "empate": p1x2.empate,
+                "visitante": p1x2.visitante,
+            }
+            prob_local_pi = self.pi_ratings.probabilidad_local(
+                consulta.local, consulta.visitante
+            )
+            prob_pi_dict = {
+                "local": prob_local_pi,
+                "empate": 0.25,
+                "visitante": max(0.0, 1.0 - prob_local_pi - 0.25),
+            }
+            probs_final = combinar_1x2(prob_poisson_dict, prob_pi_dict)
+
+        # Derivar lambdas desde las probabilidades (aproximado)
+        prob_local = probs_final["local"]
+        prob_visit = probs_final["visitante"]
+        lambda_local = 1.2 + (prob_local - prob_visit) * 0.8
+        lambda_visitante = 1.2 - (prob_local - prob_visit) * 0.8
+        lambda_local = max(0.5, min(lambda_local, 3.0))
+        lambda_visitante = max(0.5, min(lambda_visitante, 3.0))
+
+        goles = calcular_lambda(lambda_local, lambda_local, lambda_visitante, lambda_visitante)
+        matriz = self.poisson.calcular_matriz(goles.lambda_local, goles.lambda_visitante)
+
+        over15, under15 = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 1.5)
+        over25, under25 = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 2.5)
+        over35, under35 = self.poisson.calcular_over_under(goles.lambda_local, goles.lambda_visitante, 3.5)
+        btts_si, btts_no = self.poisson.calcular_btts(goles.lambda_local, goles.lambda_visitante)
+
+        mejor_marcador = ""
+        mejor_prob = 0.0
+        for i in range(5):
+            for j in range(5):
+                p = float(matriz[i, j])
+                if p > mejor_prob:
+                    mejor_prob = p
+                    mejor_marcador = f"{i}-{j}"
+
+        mercados = {
+            "over_15": over15, "under_15": under15,
+            "over_25": over25, "under_25": under25,
+            "over_35": over35, "under_35": under35,
+            "btts_si": btts_si, "btts_no": btts_no,
+        }
+
+        max_prob = max(probs_final.values())
+        if max_prob > 0.55:
+            confianza = "alta"
+        elif max_prob > 0.45:
+            confianza = "media"
+        else:
+            confianza = "baja"
+
+        respuesta = RespuestaPronostico(
+            local=consulta.local,
+            visitante=consulta.visitante,
+            probabilidades=probs_final,
+            mercados=mercados,
+            confianza=confianza,
+            marcador_top=mejor_marcador,
+            marcador_prob=mejor_prob,
+            datos_reales=datos_reales,
+            fuente=fuente,
+        )
+
+        if guardar:
+            datos = DatosPronostico(
+                evento_id=f"{consulta.local}_{consulta.visitante}",
+                liga="desconocida",
+                local=consulta.local,
+                visitante=consulta.visitante,
+                mercado="1x2",
+                seleccion="principal",
+                probabilidad=max_prob,
+                confianza=confianza,
+            )
+            try:
+                self.guardador.guardar(datos)
+            except Exception as e:
+                logger.error(f"Error guardando: {e}")
+
+        return respuesta
+
+
+__all__ = ["Orquestador", "RespuestaPronostico"]
+===== ./agent/validacion.py =====
+"""Validacion de entradas del usuario."""
+from __future__ import annotations
+import re
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ConsultaPartido:
+    local: str
+    visitante: str
+    fecha: Optional[datetime] = None
+
+class ValidacionError(Exception):
+    pass
+
+def validar_texto(texto: str) -> ConsultaPartido:
+    if not texto or not texto.strip():
+        raise ValidacionError("La consulta esta vacia")
+
+    texto = texto.strip()
+    patrones = [
+        r"^(.+?)\s+(?:vs|VS|v\.|contra)\s+(.+?)$",
+        r"^(.+?)\s+-\s+(.+?)$",
+    ]
+
+    for patron in patrones:
+        m = re.match(patron, texto, re.IGNORECASE)
+        if m:
+            local = m.group(1).strip()
+            visitante = m.group(2).strip()
+            if len(local) < 2 or len(visitante) < 2:
+                raise ValidacionError("Nombre de equipo muy corto")
+            return ConsultaPartido(local=local, visitante=visitante)
+
+    raise ValidacionError(
+        "Formato invalido. Usa: 'Equipo Local vs Equipo Visitante'"
+    )
+
+def validar_fecha(fecha: Optional[datetime]) -> Optional[datetime]:
+    if fecha is None:
+        return None
+    ahora = datetime.now()
+    if fecha < ahora - timedelta(days=365):
+        raise ValidacionError("Fecha muy antigua")
+    if fecha > ahora + timedelta(days=365):
+        raise ValidacionError("Fecha muy futura")
+    return fecha
+
+__all__ = ["validar_texto", "validar_fecha", "ConsultaPartido", "ValidacionError"]
+===== ./auditoria/__init__.py =====
+===== ./auditoria/ajustador_pesos.py =====
+"""Ajusta los pesos del ensemble segun rendimiento historico."""
+from __future__ import annotations
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+PESOS_PATH = Path("pesos_ensemble.json")
+LEARNING_RATE = 0.02
+
+PESOS_INICIALES = {"poisson": 0.45, "pi_ratings": 0.30, "mercado": 0.25}
+
+class AjustadorPesos:
+    def __init__(self):
+        self.pesos = self.cargar()
+
+    def cargar(self) -> dict:
+        if not PESOS_PATH.exists():
+            return dict(PESOS_INICIALES)
+        try:
+            data = json.loads(PESOS_PATH.read_text())
+            if not all(k in data for k in PESOS_INICIALES):
+                return dict(PESOS_INICIALES)
+            return data
+        except Exception:
+            return dict(PESOS_INICIALES)
+
+    def guardar(self):
+        try:
+            data = dict(self.pesos)
+            data["fecha"] = datetime.now().isoformat()
+            PESOS_PATH.write_text(json.dumps(data, indent=2))
+        except Exception as e:
+            logger.error(f"Error guardando pesos: {e}")
+
+    def ajustar(self, brier_por_modelo: dict):
+        for modelo, brier in brier_por_modelo.items():
+            if modelo not in self.pesos:
+                continue
+            if brier > 0.25:
+                delta = LEARNING_RATE * (brier - 0.20)
+                self.pesos[modelo] = max(0.10, self.pesos[modelo] - delta)
+            elif brier < 0.18:
+                delta = LEARNING_RATE * (0.20 - brier)
+                self.pesos[modelo] = min(0.70, self.pesos[modelo] + delta)
+
+        total = sum(self.pesos.values())
+        if total > 0:
+            self.pesos = {k: v / total for k, v in self.pesos.items()}
+
+        self.guardar()
+        return dict(self.pesos)
+
+__all__ = ["AjustadorPesos", "PESOS_INICIALES", "LEARNING_RATE"]
+===== ./auditoria/calibrador.py =====
+"""Calibrador automatico de probabilidades basado en historico."""
+from __future__ import annotations
+import json
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+CALIBRADOR_PATH = Path("calibrador.json")
+
+class CalibradorAutomatico:
+    def __init__(self):
+        self.modelo = None
+        self.entrenado = False
+        self.cargar()
+
+    def entrenar(self, probs: list, resultados: list) -> bool:
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            self.modelo = IsotonicRegression(out_of_bounds="clip")
+            self.modelo.fit(probs, resultados)
+            self.entrenado = True
+            return True
+        except Exception as e:
+            logger.error(f"Error entrenando: {e}")
+            return False
+
+    def calibrar(self, prob: float) -> float:
+        if not self.entrenado or self.modelo is None:
+            return prob
+        try:
+            return float(self.modelo.predict([prob])[0])
+        except Exception:
+            return prob
+
+    def guardar(self):
+        if not self.entrenado or self.modelo is None:
+            return
+        try:
+            data = {
+                "x": self.modelo.X_thresholds_.tolist(),
+                "y": self.modelo.y_thresholds_.tolist(),
+                "fecha": datetime.now().isoformat(),
+            }
+            CALIBRADOR_PATH.write_text(json.dumps(data))
+        except Exception as e:
+            logger.error(f"Error guardando calibrador: {e}")
+
+    def cargar(self):
+        if not CALIBRADOR_PATH.exists():
+            return
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            data = json.loads(CALIBRADOR_PATH.read_text())
+            self.modelo = IsotonicRegression(out_of_bounds="clip")
+            self.modelo.fit(data["x"], data["y"])
+            self.entrenado = True
+        except Exception as e:
+            logger.error(f"Error cargando calibrador: {e}")
+
+__all__ = ["CalibradorAutomatico"]
+===== ./auditoria/evaluar.py =====
+"""Evalua pronosticos comparando con resultados reales."""
+from __future__ import annotations
+import logging
+from datetime import datetime
+from typing import Optional
+from data.db import get_session
+from auditoria.guardar import PronosticoDB
+
+logger = logging.getLogger(__name__)
+
+class Evaluador:
+    def __init__(self):
+        pass
+
+    def evaluar_partido(self, evento_id: str, goles_local: int, goles_visitante: int) -> int:
+        with get_session() as s:
+            pronosticos = s.query(PronosticoDB).filter(
+                PronosticoDB.evento_id == evento_id,
+                PronosticoDB.resultado == "PENDIENTE"
+            ).all()
+
+            for p in pronosticos:
+                acertado = self._verificar(
+                    p.mercado, p.seleccion, goles_local, goles_visitante
+                )
+                p.resultado = "ACERTADO" if acertado else "FALLADO"
+                p.goles_local = goles_local
+                p.goles_visitante = goles_visitante
+
+                valor = 1.0 if acertado else 0.0
+                p.brier_score = (p.probabilidad - valor) ** 2
+
+            s.commit()
+            return len(pronosticos)
+
+    def _verificar(self, mercado: str, seleccion: str, gl: int, gv: int) -> bool:
+        m = mercado.lower()
+        s = seleccion.lower()
+
+        if m == "1x2":
+            if s == "local":
+                return gl > gv
+            elif s == "empate":
+                return gl == gv
+            elif s == "visitante":
+                return gl < gv
+
+        elif m in ("over_2_5", "over25"):
+            return (gl + gv) > 2.5
+        elif m in ("under_2_5", "under25"):
+            return (gl + gv) < 2.5
+
+        elif m in ("btts", "ambos_marcan"):
+            ambos = gl > 0 and gv > 0
+            return ambos if s == "si" else not ambos
+
+        return False
+
+__all__ = ["Evaluador"]
+===== ./auditoria/guardar.py =====
+"""Guarda pronosticos con contexto completo para auditoria."""
+from __future__ import annotations
+import json
+import logging
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Optional
+from sqlalchemy import String, Float, DateTime, Text, Integer
+from sqlalchemy.orm import Mapped, mapped_column
+from data.db import Base, get_session, init_db
+
+logger = logging.getLogger(__name__)
+
+class PronosticoDB(Base):
+    __tablename__ = "pronosticos"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    evento_id: Mapped[str] = mapped_column(String(50), index=True)
+    fecha: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    liga: Mapped[str] = mapped_column(String(100))
+    local: Mapped[str] = mapped_column(String(100))
+    visitante: Mapped[str] = mapped_column(String(100))
+    mercado: Mapped[str] = mapped_column(String(50))
+    seleccion: Mapped[str] = mapped_column(String(50))
+    probabilidad: Mapped[float] = mapped_column(Float)
+    cuota: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    confianza: Mapped[str] = mapped_column(String(20))
+    datos_contexto: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    resultado: Mapped[str] = mapped_column(String(20), default="PENDIENTE")
+    goles_local: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    goles_visitante: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    brier_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+@dataclass
+class DatosPronostico:
+    evento_id: str
+    liga: str
+    local: str
+    visitante: str
+    mercado: str
+    seleccion: str
+    probabilidad: float
+    cuota: Optional[float] = None
+    confianza: str = "media"
+    contexto: dict = None
+
+class GuardadorPronosticos:
+    def __init__(self):
+        init_db()
+
+    def guardar(self, datos: DatosPronostico) -> int:
+        with get_session() as s:
+            p = PronosticoDB(
+                evento_id=datos.evento_id,
+                liga=datos.liga,
+                local=datos.local,
+                visitante=datos.visitante,
+                mercado=datos.mercado,
+                seleccion=datos.seleccion,
+                probabilidad=datos.probabilidad,
+                cuota=datos.cuota,
+                confianza=datos.confianza,
+                datos_contexto=json.dumps(datos.contexto or {}, default=str),
+            )
+            s.add(p)
+            s.commit()
+            return p.id
+
+    def pendientes(self) -> list:
+        with get_session() as s:
+            return s.query(PronosticoDB).filter(PronosticoDB.resultado == "PENDIENTE").all()
+
+__all__ = ["GuardadorPronosticos", "DatosPronostico", "PronosticoDB"]
+===== ./auditoria/metricas.py =====
+"""Metricas de rendimiento: Brier Score, LogLoss, ROI."""
+from __future__ import annotations
+import logging
+import math
+from dataclasses import dataclass
+from data.db import get_session
+from auditoria.guardar import PronosticoDB
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Metricas:
+    total: int
+    aciertos: int
+    fallos: int
+    precision: float
+    brier_score: float
+    log_loss: float
+    roi: float
+
+
+class CalculadoraMetricas:
+    def calcular(self) -> Metricas:
+        with get_session() as s:
+            pronosticos = s.query(PronosticoDB).filter(
+                PronosticoDB.resultado.in_(["ACERTADO", "FALLADO"])
+            ).all()
+
+        if not pronosticos:
+            return Metricas(0, 0, 0, 0.0, 1.0, 1.0, 0.0)
+
+        total = len(pronosticos)
+        aciertos = sum(1 for p in pronosticos if p.resultado == "ACERTADO")
+        fallos = total - aciertos
+
+        brier = sum(p.brier_score or 1.0 for p in pronosticos) / total
+
+        logloss_vals = []
+        for p in pronosticos:
+            prob = max(min(p.probabilidad, 0.999), 0.001)
+            y = 1.0 if p.resultado == "ACERTADO" else 0.0
+            logloss_vals.append(-(y * math.log(prob) + (1 - y) * math.log(1 - prob)))
+        logloss = sum(logloss_vals) / total
+
+        ganancia = 0.0
+        apostado = 0.0
+        for p in pronosticos:
+            if p.cuota and p.cuota > 0:
+                apostado += 1.0
+                if p.resultado == "ACERTADO":
+                    ganancia += p.cuota - 1.0
+                else:
+                    ganancia -= 1.0
+        roi = (ganancia / apostado * 100) if apostado > 0 else 0.0
+
+        return Metricas(
+            total=total,
+            aciertos=aciertos,
+            fallos=fallos,
+            precision=aciertos / total,
+            brier_score=brier,
+            log_loss=logloss,
+            roi=roi,
+        )
+
+    def tabla_por_partido(self) -> dict:
+        """Retorna tabla: mercados x partidos con ACERTO/FALLIDO."""
+        with get_session() as s:
+            pronosticos = s.query(PronosticoDB).filter(
+                PronosticoDB.resultado.in_(["ACERTADO", "FALLADO"])
+            ).all()
+
+        partidos = []
+        tabla = {}
+
+        for p in pronosticos:
+            etiqueta = f"{p.local[:6]}-{p.visitante[:6]}"
+            if etiqueta not in partidos:
+                partidos.append(etiqueta)
+
+            clave = f"{p.mercado} {p.seleccion}".strip()
+            if clave not in tabla:
+                tabla[clave] = {}
+
+            if p.resultado == "ACERTADO":
+                tabla[clave][etiqueta] = "ACERTO"
+            else:
+                tabla[clave][etiqueta] = "DESACERTO"
+
+        return {"partidos": partidos, "tabla": tabla}
+
+
+__all__ = ["CalculadoraMetricas", "Metricas"]
+===== ./betting/__init__.py =====
+===== ./betting/bankroll.py =====
+"""Gestion de bankroll con Kelly Criterion fraccional."""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+FRACCION_KELLY = 0.25
+STAKE_MAXIMO = 0.05
+
+@dataclass
+class ApuestaSugerida:
+    stake: float
+    fraccion_bankroll: float
+    kelly_completo: float
+    kelly_fraccionado: float
+
+class GestorBankroll:
+    def __init__(self, bankroll: float, fraccion: float = FRACCION_KELLY):
+        self.bankroll = bankroll
+        self.fraccion = fraccion
+
+    def calcular_stake(self, prob: float, cuota: float) -> ApuestaSugerida:
+        if cuota <= 1.0 or prob <= 0.0 or prob >= 1.0:
+            return ApuestaSugerida(0.0, 0.0, 0.0, 0.0)
+
+        b = cuota - 1.0
+        q = 1.0 - prob
+        kelly_completo = (prob * b - q) / b
+
+        if kelly_completo <= 0:
+            return ApuestaSugerida(0.0, 0.0, kelly_completo, 0.0)
+
+        kelly_fraccionado = kelly_completo * self.fraccion
+        fraccion_final = min(kelly_fraccionado, STAKE_MAXIMO)
+        stake = self.bankroll * fraccion_final
+
+        return ApuestaSugerida(
+            stake=stake,
+            fraccion_bankroll=fraccion_final,
+            kelly_completo=kelly_completo,
+            kelly_fraccionado=kelly_fraccionado,
+        )
+
+    def actualizar_bankroll(self, ganancia: float):
+        self.bankroll += ganancia
+
+__all__ = ["GestorBankroll", "ApuestaSugerida", "FRACCION_KELLY", "STAKE_MAXIMO"]
+===== ./betting/combinadas.py =====
+"""Generador de combinadas de 2-3 mercados con cuota > 1.50."""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+CUOTA_MINIMA = 1.50
+MAX_PICKS = 3
+PROB_MINIMA = 0.55
+
+@dataclass
+class Combinada:
+    picks: list = field(default_factory=list)
+    cuota_total: float = 1.0
+    probabilidad_total: float = 1.0
+
+class GeneradorCombinadas:
+    def __init__(self, cuota_minima: float = CUOTA_MINIMA):
+        self.cuota_minima = cuota_minima
+
+    def generar(self, candidatos: list) -> Combinada:
+        elegibles = [c for c in candidatos if c.get("probabilidad", 0) >= PROB_MINIMA]
+        elegibles.sort(key=lambda x: x.get("probabilidad", 0), reverse=True)
+
+        combinada = Combinada()
+        for cand in elegibles:
+            if len(combinada.picks) >= MAX_PICKS:
+                break
+            prob = cand.get("probabilidad", 0)
+            cuota = cand.get("cuota", 1.0 / prob if prob > 0 else 1.0)
+            if cuota <= 1.0:
+                continue
+            combinada.picks.append(cand)
+            combinada.cuota_total *= cuota
+            combinada.probabilidad_total *= prob
+            if (len(combinada.picks) >= 2 and
+                combinada.cuota_total >= self.cuota_minima):
+                break
+
+        if len(combinada.picks) < 2:
+            return Combinada()
+        return combinada
+
+__all__ = ["GeneradorCombinadas", "Combinada", "CUOTA_MINIMA", "MAX_PICKS", "PROB_MINIMA"]
+===== ./betting/value_betting.py =====
+"""Detecta apuestas con valor esperado positivo (EV+)."""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+EV_MINIMO = 0.03
+
+@dataclass
+class ValueBet:
+    mercado: str
+    seleccion: str
+    probabilidad: float
+    cuota: float
+    valor_esperado: float
+    stake_sugerido: float = 0.0
+
+class DetectorValue:
+    def __init__(self, ev_minimo: float = EV_MINIMO):
+        self.ev_minimo = ev_minimo
+
+    def calcular_ev(self, prob: float, cuota: float) -> float:
+        return (prob * cuota) - 1.0
+
+    def detectar(self, probabilidades: dict, cuotas: dict) -> list:
+        value_bets = []
+
+        for mercado, data in probabilidades.items():
+            if isinstance(data, dict):
+                for seleccion, prob in data.items():
+                    clave_cuota = f"{mercado}:{seleccion}"
+                    cuota = cuotas.get(clave_cuota) or cuotas.get(mercado, {}).get(seleccion)
+                    if not cuota or cuota <= 1.0:
+                        continue
+                    ev = self.calcular_ev(prob, cuota)
+                    if ev >= self.ev_minimo:
+                        value_bets.append(ValueBet(
+                            mercado=mercado,
+                            seleccion=seleccion,
+                            probabilidad=prob,
+                            cuota=cuota,
+                            valor_esperado=ev,
+                        ))
+            elif isinstance(data, (int, float)):
+                cuota = cuotas.get(mercado)
+                if not cuota or cuota <= 1.0:
+                    continue
+                ev = self.calcular_ev(data, cuota)
+                if ev >= self.ev_minimo:
+                    value_bets.append(ValueBet(
+                        mercado=mercado,
+                        seleccion="principal",
+                        probabilidad=data,
+                        cuota=cuota,
+                        valor_esperado=ev,
+                    ))
+
+        value_bets.sort(key=lambda v: v.valor_esperado, reverse=True)
+        return value_bets
+
+__all__ = ["DetectorValue", "ValueBet", "EV_MINIMO"]
+===== ./bot.py =====
+"""Bot de Telegram para pronosticos deportivos."""
+from __future__ import annotations
+import logging
+import os
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from agent.orquestador import Orquestador
+from agent.validacion import ValidacionError
+from auditoria.metricas import CalculadoraMetricas
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+orquestador = Orquestador(bankroll=1000.0)
+calculadora = CalculadoraMetricas()
+
+
+def formatear_cuadro(r) -> str:
+    p = r.probabilidades
+    m = r.mercados
+    fuente = r.fuente
+
+    doble_1x = p['local'] + p['empate']
+    doble_12 = p['local'] + p['visitante']
+    doble_x2 = p['empate'] + p['visitante']
+
+    h_local_m1 = max(0.0, p['local'] - 0.15)
+    h_local_m05 = max(0.0, p['local'])
+    h_visita_p05 = max(0.0, p['visitante'] + p['empate'])
+
+    corners_o85 = 0.667
+    corners_o95 = 0.542
+    corners_o105 = 0.417
+    tarjetas_o35 = 0.658
+    tarjetas_o45 = 0.468
+    tarjetas_o55 = 0.297
+
+    lineas = [
+        f"⚽ {r.local} vs {r.visitante}",
+        f"Fuente: {fuente}",
+        "",
+        "+---------------------+------------+-------+",
+        "| MERCADO             | SELECCION  | PROB  |",
+        "+---------------------+------------+-------+",
+        f"| Ganador             | Local      | {p['local']*100:5.1f}%|",
+        f"| Ganador             | Empate     | {p['empate']*100:5.1f}%|",
+        f"| Ganador             | Visita     | {p['visitante']*100:5.1f}%|",
+        "+---------------------+------------+-------+",
+        f"| Doble Oport.        | 1X         | {doble_1x*100:5.1f}%|",
+        f"| Doble Oport.        | 12         | {doble_12*100:5.1f}%|",
+        f"| Doble Oport.        | X2         | {doble_x2*100:5.1f}%|",
+        "+---------------------+------------+-------+",
+        f"| Goles               | Over 1.5   | {m['over_15']*100:5.1f}%|",
+        f"| Goles               | Under 1.5  | {m['under_15']*100:5.1f}%|",
+        f"| Goles               | Over 2.5   | {m['over_25']*100:5.1f}%|",
+        f"| Goles               | Under 2.5  | {m['under_25']*100:5.1f}%|",
+        f"| Goles               | Over 3.5   | {m['over_35']*100:5.1f}%|",
+        f"| Goles               | Under 3.5  | {m['under_35']*100:5.1f}%|",
+        "+---------------------+------------+-------+",
+        f"| Ambos Anotan        | Si         | {m['btts_si']*100:5.1f}%|",
+        f"| Ambos Anotan        | No         | {m['btts_no']*100:5.1f}%|",
+        "+---------------------+------------+-------+",
+        f"| Handicap            | Local -1   | {h_local_m1*100:5.1f}%|",
+        f"| Handicap            | Local -0.5 | {h_local_m05*100:5.1f}%|",
+        f"| Handicap            | Visita +0.5| {h_visita_p05*100:5.1f}%|",
+        "+---------------------+------------+-------+",
+        f"| Corners (Aprox)     | Over 8.5   | {corners_o85*100:5.1f}%|",
+        f"| Corners (Aprox)     | Over 9.5   | {corners_o95*100:5.1f}%|",
+        f"| Corners (Aprox)     | Over 10.5  | {corners_o105*100:5.1f}%|",
+        "+---------------------+------------+-------+",
+        f"| Tarjetas (Aprox)    | Over 3.5   | {tarjetas_o35*100:5.1f}%|",
+        f"| Tarjetas (Aprox)    | Over 4.5   | {tarjetas_o45*100:5.1f}%|",
+        f"| Tarjetas (Aprox)    | Over 5.5   | {tarjetas_o55*100:5.1f}%|",
+        "+---------------------+------------+-------+",
+        f"| Marcador            | {r.marcador_top:^10s} | {r.marcador_prob*100:5.1f}%|",
+        "+---------------------+------------+-------+",
+        "",
+        f"🎯 Confianza: {r.confianza.upper()}",
+    ]
+    return "\n".join(lineas)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 *Bot de Pronosticos*\n\n"
+        "Comandos:\n"
+        "• `/analizar Real Madrid vs Barcelona`\n"
+        "• `/rendimiento` - Ver estadisticas\n"
+        "• `/ayuda` - Ver esta ayuda",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Uso: `/analizar Equipo Local vs Equipo Visitante`",
+            parse_mode="Markdown",
+        )
+        return
+    texto = " ".join(context.args)
+    await update.message.reply_text("🔍 Analizando...")
+    try:
+        r = await orquestador.procesar(texto, guardar=True)
+        cuadro = formatear_cuadro(r)
+        await update.message.reply_text(f"```\n{cuadro}\n```", parse_mode="Markdown")
+    except ValidacionError as e:
+        await update.message.reply_text(f"❌ {e}")
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+
+async def cmd_rendimiento(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    m = calculadora.calcular()
+    await update.message.reply_text(
+        f"📊 *Rendimiento*\n\n"
+        f"• Total: `{m.total}`\n"
+        f"• Aciertos: `{m.aciertos}`\n"
+        f"• Fallos: `{m.fallos}`\n"
+        f"• Precision: `{m.precision*100:.1f}%`\n"
+        f"• Brier Score: `{m.brier_score:.3f}`\n"
+        f"• ROI: `{m.roi:.1f}%`",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+
+def main():
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_TOKEN no configurado")
+        return
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ayuda", cmd_ayuda))
+    app.add_handler(CommandHandler("analizar", cmd_analizar))
+    app.add_handler(CommandHandler("rendimiento", cmd_rendimiento))
+    logger.info("🤖 Bot iniciado")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
+===== ./data/__init__.py =====
+===== ./data/bzzoiro_client.py =====
+"""Cliente completo para la API de Bzzoiro."""
+from __future__ import annotations
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+import httpx
+
+logger = logging.getLogger(__name__)
+BASE_URL = "https://sports.bzzoiro.com/api/v2"
+
+
+@dataclass
+class DatosEquipo:
+    equipo_id: int
+    nombre: str
+    goles_promedio: float = 1.3
+    goles_recibidos: float = 1.3
+    forma: list = field(default_factory=list)
+    xg_promedio: float = 1.3
+    xg_recibido: float = 1.3
+
+
+class BzzoiroClient:
+    def __init__(self, api_key: Optional[str] = None, timeout: float = 15.0):
+        self.api_key = api_key or os.getenv("BZZOIRO_API_KEY", "")
+        self.timeout = timeout
+        self.headers = {
+            "Authorization": f"Token {self.api_key}",
+            "Accept": "application/json",
+        }
+
+    async def _get(self, endpoint: str, params: Optional[dict] = None) -> dict:
+        if not self.api_key:
+            logger.warning("BZZOIRO_API_KEY no configurada")
+            return {}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as c:
+                r = await c.get(
+                    f"{BASE_URL}/{endpoint}",
+                    headers=self.headers,
+                    params=params or {},
+                )
+                r.raise_for_status()
+                return r.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP {e.response.status_code} en {endpoint}")
+            return {}
+        except Exception as e:
+            logger.error(f"Error Bzzoiro {endpoint}: {e}")
+            return {}
+
+    async def buscar_partido(self, equipo_local: str, equipo_visitante: str):
+        data = await self._get("events/", params={"team_name": equipo_local, "limit": 50})
+        partidos = data.get("results", [])
+        for p in partidos:
+            home = p.get("home_team", "").lower()
+            away = p.get("away_team", "").lower()
+            if (equipo_local.lower() in home and equipo_visitante.lower() in away):
+                return p
+        return None
+
+    async def stats_partido(self, evento_id: int) -> dict:
+        return await self._get(f"events/{evento_id}/stats/")
+
+    async def h2h_partido(self, evento_id: int) -> dict:
+        return await self._get(f"events/{evento_id}/h2h/")
+
+    async def alineaciones(self, evento_id: int) -> dict:
+        return await self._get(f"events/{evento_id}/lineups/")
+
+    async def cuotas(self, evento_id: int) -> dict:
+        """Cuotas decimales por mercado."""
+        return await self._get(f"events/{evento_id}/odds/")
+
+    async def predicciones(self, evento_id: int) -> dict:
+        """Predicciones ML (plural - según docs)."""
+        return await self._get(f"predictions/{evento_id}/")
+
+    async def detalles_partido(self, evento_id: int) -> dict:
+        return await self._get(f"events/{evento_id}/")
+
+    async def partidos_hoy(self) -> list:
+        data = await self._get("events/", params={"status": "upcoming", "limit": 100})
+        return data.get("results", [])
+
+    async def probabilidades_mercado(self, evento_id: int) -> Optional[dict]:
+        """
+        Obtiene probabilidades implícitas del mercado 1X2 desde las cuotas.
+        Retorna {"local": p1, "empate": p2, "visitante": p3} normalizadas.
+        """
+        cuotas = await self.cuotas(evento_id)
+        if not cuotas:
+            return None
+
+        # Buscar cuotas 1X2 en diferentes formatos posibles
+        home_odd = None
+        draw_odd = None
+        away_odd = None
+
+        # Formato 1: dict con markets
+        if isinstance(cuotas, dict):
+            markets = cuotas.get("markets") or cuotas.get("odds") or cuotas
+            if isinstance(markets, dict):
+                h2h = markets.get("1x2") or markets.get("h2h") or markets.get("match_winner")
+                if isinstance(h2h, dict):
+                    home_odd = h2h.get("home") or h2h.get("1")
+                    draw_odd = h2h.get("draw") or h2h.get("X")
+                    away_odd = h2h.get("away") or h2h.get("2")
+                elif isinstance(h2h, list):
+                    for o in h2h:
+                        sel = str(o.get("selection", "")).lower()
+                        if sel in ("home", "1", "local"):
+                            home_odd = o.get("odd") or o.get("price")
+                        elif sel in ("draw", "x", "empate"):
+                            draw_odd = o.get("odd") or o.get("price")
+                        elif sel in ("away", "2", "visitante"):
+                            away_odd = o.get("odd") or o.get("price")
+
+        if not (home_odd and draw_odd and away_odd):
+            logger.warning(f"No se pudieron extraer cuotas 1X2 de: {str(cuotas)[:200]}")
+            return None
+
+        try:
+            p_home = 1.0 / float(home_odd)
+            p_draw = 1.0 / float(draw_odd)
+            p_away = 1.0 / float(away_odd)
+            total = p_home + p_draw + p_away
+            return {
+                "local": p_home / total,
+                "empate": p_draw / total,
+                "visitante": p_away / total,
+            }
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error calculando probabilidades: {e}")
+            return None
+
+
+__all__ = ["BzzoiroClient", "DatosEquipo"]
+===== ./data/cache.py =====
+"""Sistema de cache con SQLite para APIs."""
+from __future__ import annotations
+import json
+import logging
+from datetime import datetime, timedelta
+from typing import Any, Optional
+from sqlalchemy import String, DateTime, Text
+from sqlalchemy.orm import Mapped, mapped_column
+from data.db import Base, get_session, init_db
+
+logger = logging.getLogger(__name__)
+
+class CacheEntry(Base):
+    __tablename__ = "cache"
+    clave: Mapped[str] = mapped_column(String(200), primary_key=True)
+    valor: Mapped[str] = mapped_column(Text)
+    actualizado: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+class Cache:
+    def __init__(self, horas: int = 24):
+        self.horas = horas
+        init_db()
+
+    def get(self, clave: str) -> Optional[Any]:
+        with get_session() as s:
+            e = s.get(CacheEntry, clave)
+            if not e:
+                return None
+            if datetime.now() - e.actualizado > timedelta(hours=self.horas):
+                return None
+            return json.loads(e.valor)
+
+    def set(self, clave: str, valor: Any):
+        with get_session() as s:
+            e = s.get(CacheEntry, clave)
+            if e:
+                e.valor = json.dumps(valor, default=str)
+                e.actualizado = datetime.now()
+            else:
+                s.add(CacheEntry(clave=clave, valor=json.dumps(valor, default=str)))
+            s.commit()
+
+__all__ = ["Cache", "CacheEntry"]
+===== ./data/clima.py =====
+"""
+Módulo de clima para partidos de fútbol.
+
+Usa Open-Meteo API (gratuita, sin API key) para obtener:
+- Clima actual en la ubicación del estadio.
+- Pronóstico para la fecha del partido.
+- Datos históricos de clima en partidos anteriores.
+
+La altitud y el clima afectan el rendimiento físico de los jugadores,
+especialmente en ligas con estadios en zonas de altura.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
+
+
+@dataclass
+class DatosClima:
+    """Datos climáticos de una ubicación."""
+    latitud: float
+    longitud: float
+    altitud_m: float
+    temperatura_c: Optional[float] = None
+    humedad_pct: Optional[float] = None
+    viento_kmh: Optional[float] = None
+    precipitacion_mm: Optional[float] = None
+    condicion: str = "desconocida"
+
+
+class ClienteClima:
+    """
+    Cliente para obtener datos climáticos de Open-Meteo.
+
+    Uso:
+        cliente = ClienteClima()
+        clima = await cliente.obtener_clima_actual(-12.05, -77.03)
+    """
+
+    def __init__(self, timeout: float = 10.0):
+        self.timeout = timeout
+
+    async def obtener_clima_actual(
+        self, latitud: float, longitud: float
+    ) -> Optional[DatosClima]:
+        """Obtiene el clima actual en coordenadas dadas."""
+        params = {
+            "latitude": latitud,
+            "longitude": longitud,
+            "current": (
+                "temperature_2m,relative_humidity_2m,"
+                "wind_speed_10m,precipitation"
+            ),
+            "timezone": "auto",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(OPEN_METEO_URL, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+
+            current = data.get("current", {})
+            elevation = data.get("elevation", 0)
+
+            return DatosClima(
+                latitud=latitud,
+                longitud=longitud,
+                altitud_m=elevation,
+                temperatura_c=current.get("temperature_2m"),
+                humedad_pct=current.get("relative_humidity_2m"),
+                viento_kmh=current.get("wind_speed_10m"),
+                precipitacion_mm=current.get("precipitation"),
+                condicion=self._clasificar_condicion(
+                    current.get("precipitation", 0),
+                    current.get("wind_speed_10m", 0),
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Error obteniendo clima: {e}")
+            return None
+
+    async def obtener_clima_historico(
+        self,
+        latitud: float,
+        longitud: float,
+        fecha: str,
+    ) -> Optional[DatosClima]:
+        """Obtiene clima histórico para una fecha (YYYY-MM-DD)."""
+        params = {
+            "latitude": latitud,
+            "longitude": longitud,
+            "start_date": fecha,
+            "end_date": fecha,
+            "daily": "temperature_2m_mean,precipitation_sum,wind_speed_10m_max",
+            "timezone": "auto",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(OPEN_METEO_ARCHIVE, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+
+            daily = data.get("daily", {})
+            elevation = data.get("elevation", 0)
+
+            return DatosClima(
+                latitud=latitud,
+                longitud=longitud,
+                altitud_m=elevation,
+                temperatura_c=(daily.get("temperature_2m_mean") or [None])[0],
+                viento_kmh=(daily.get("wind_speed_10m_max") or [None])[0],
+                precipitacion_mm=(daily.get("precipitation_sum") or [None])[0],
+            )
+        except Exception as e:
+            logger.error(f"Error obteniendo clima histórico: {e}")
+            return None
+
+    @staticmethod
+    def _clasificar_condicion(precipitacion: float, viento: float) -> str:
+        """Clasifica la condición climática."""
+        if precipitacion > 5:
+            return "lluvia_fuerte"
+        elif precipitacion > 0.5:
+            return "lluvia_ligera"
+        elif viento > 40:
+            return "viento_fuerte"
+        elif viento > 20:
+            return "viento_moderado"
+        return "despejado"
+
+
+__all__ = ["ClienteClima", "DatosClima"]===== ./data/db.py =====
+"""Conexion a base de datos con SQLAlchemy."""
+from __future__ import annotations
+from pathlib import Path
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+DB_PATH = Path("bot.db")
+DATABASE_URL = f"sqlite:///{DB_PATH}"
+
+class Base(DeclarativeBase):
+    pass
+
+engine = create_engine(DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(bind=engine)
+
+def init_db():
+    Base.metadata.create_all(engine)
+
+def get_session():
+    return SessionLocal()
+
+__all__ = ["engine", "SessionLocal", "Base", "init_db", "get_session"]
+===== ./data/equipos.py =====
+"""Informacion de equipos de futbol."""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Equipo:
+    nombre: str
+    pais: Optional[str] = None
+    liga: Optional[str] = None
+    estadio: Optional[str] = None
+    altitud_m: Optional[float] = None
+    escudo_url: Optional[str] = None
+
+@dataclass
+class EstadisticasEquipo:
+    equipo: str
+    partidos_jugados: int = 0
+    goles_favor: int = 0
+    goles_contra: int = 0
+    corners_promedio: float = 0.0
+    tarjetas_promedio: float = 0.0
+    forma_reciente: list = field(default_factory=list)
+
+    @property
+    def goles_promedio(self) -> float:
+        if self.partidos_jugados == 0:
+            return 0.0
+        return self.goles_favor / self.partidos_jugados
+
+    @property
+    def goles_recibidos_promedio(self) -> float:
+        if self.partidos_jugados == 0:
+            return 0.0
+        return self.goles_contra / self.partidos_jugados
+
+__all__ = ["Equipo", "EstadisticasEquipo"]
+===== ./data/eventos.py =====
+"""Gestion de eventos y partidos."""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Evento:
+    evento_id: str
+    liga: str
+    local: str
+    visitante: str
+    fecha_hora: datetime
+    estado: str = "programado"
+    resultado_local: Optional[int] = None
+    resultado_visitante: Optional[int] = None
+
+def crear_desde_bzzoiro(data: dict) -> Optional[Evento]:
+    try:
+        return Evento(
+            evento_id=str(data.get("id", "")),
+            liga=data.get("league_name", "Desconocida"),
+            local=data.get("home_team", ""),
+            visitante=data.get("away_team", ""),
+            fecha_hora=datetime.fromisoformat(
+                data.get("start_time", datetime.now().isoformat())
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Error creando evento: {e}")
+        return None
+
+__all__ = ["Evento", "crear_desde_bzzoiro"]
+===== ./data/noticias.py =====
+"""Modulo de noticias y lesiones."""
+from __future__ import annotations
+import logging
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+import httpx
+
+logger = logging.getLogger(__name__)
+API_FOOTBALL_BASE = "https://v3.football.api-sports.io"
+
+
+@dataclass
+class JugadorLesionado:
+    nombre: str
+    equipo: str
+    tipo: str
+    detalle: str
+    fecha_inicio: Optional[str] = None
+    fecha_fin: Optional[str] = None
+
+
+@dataclass
+class NoticiaEquipo:
+    titulo: str
+    fuente: str
+    fecha: str
+    resumen: str = ""
+    url: str = ""
+
+
+@dataclass
+class InfoEquipo:
+    nombre: str
+    lesiones: list = field(default_factory=list)
+    noticias: list = field(default_factory=list)
+    forma_reciente: str = ""
+    ultima_actualizacion: str = ""
+
+
+class ClienteNoticias:
+    """Cliente para API-Football."""
+
+    def __init__(self, api_key: Optional[str] = None, timeout: float = 15.0):
+        self.api_key = api_key or os.getenv("API_FOOTBALL_KEY", "")
+        self.timeout = timeout
+
+    def _headers(self) -> dict:
+        return {"x-apisports-key": self.api_key}
+
+    async def obtener_lesiones(self, equipo: str, temporada: int = 2025) -> list:
+        if not self.api_key:
+            logger.warning("API_FOOTBALL_KEY no configurada.")
+            return []
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(
+                    f"{API_FOOTBALL_BASE}/injuries",
+                    headers=self._headers(),
+                    params={"team": equipo, "season": temporada},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            lesiones = []
+            for item in data.get("response", []):
+                player = item.get("player", {})
+                team = item.get("team", {})
+                fixture = item.get("fixture", {})
+                lesiones.append(JugadorLesionado(
+                    nombre=player.get("name", "Desconocido"),
+                    equipo=team.get("name", equipo),
+                    tipo=item.get("type", "lesion"),
+                    detalle=item.get("reason", "Sin detalle"),
+                    fecha_inicio=fixture.get("date"),
+                ))
+            return lesiones
+        except Exception as e:
+            logger.error(f"Error obteniendo lesiones: {e}")
+            return []
+
+    async def obtener_info_equipo(self, equipo: str) -> InfoEquipo:
+        lesiones = await self.obtener_lesiones(equipo)
+        return InfoEquipo(
+            nombre=equipo,
+            lesiones=lesiones,
+            ultima_actualizacion=datetime.now().isoformat(),
+        )
+
+
+__all__ = [
+    "ClienteNoticias",
+    "JugadorLesionado",
+    "NoticiaEquipo",
+    "InfoEquipo",
+]
+===== ./domain/__init__.py =====
+from domain.enums import (Resultado, Mercado, DireccionLinea, EstadoEvento, EstadoPronostico, TipoApuesta, Confianza, NivelRiesgo, Entorno, TipoCompeticion)
+
+__all__ = ["Resultado", "Mercado", "DireccionLinea", "EstadoEvento", "EstadoPronostico", "TipoApuesta", "Confianza", "NivelRiesgo", "Entorno", "TipoCompeticion"]
+===== ./domain/enums.py =====
+"""
+Enums del dominio de pronósticos deportivos.
+
+Este módulo define todos los tipos enumerados que representan conceptos
+del negocio. Usar enums previene errores por strings mágicos y facilita
+la validación con Pydantic.
+"""
+from enum import Enum
+
+
+# =============================================================================
+# RESULTADOS Y MERCADOS
+# =============================================================================
+
+class Resultado(str, Enum):
+    """Resultado final de un partido."""
+    LOCAL = "local"
+    EMPATE = "empate"
+    VISITANTE = "visitante"
+    
+    def __str__(self) -> str:
+        return self.value
+
+
+class Mercado(str, Enum):
+    """Tipos de mercado de apuestas disponibles."""
+    UNO_X_DOS = "1x2"
+    DOBLE_OPORTUNIDAD = "doble_oportunidad"
+    OVER_UNDER = "over_under"
+    AMBOS_MARCAN = "ambos_marcan"
+    CORNERS = "corners"
+    TARJETAS = "tarjetas"
+    SCORE_EXACTO = "score_exacto"
+    HANDICAP = "handicap"
+    GOLES_TOTALES = "goles_totales"
+    GOLEADOR = "goleador"
+
+
+class DireccionLinea(str, Enum):
+    """Dirección de una línea over/under."""
+    OVER = "over"
+    UNDER = "under"
+
+
+# =============================================================================
+# ESTADOS DE EVENTOS Y PRONÓSTICOS
+# =============================================================================
+
+class EstadoEvento(str, Enum):
+    """Estado temporal de un evento deportivo."""
+    PROGRAMADO = "programado"
+    EN_VIVO = "en_vivo"
+    FINALIZADO = "finalizado"
+    POSTPUESTO = "postpuesto"
+    CANCELADO = "cancelado"
+
+
+class EstadoPronostico(str, Enum):
+    """Estado de seguimiento de un pronóstico emitido."""
+    PENDIENTE = "pendiente"
+    ACERTADO = "acertado"
+    FALLADO = "fallado"
+    NULO = "nulo"
+
+
+class TipoApuesta(str, Enum):
+    """Tipo de apuesta emitida por el bot."""
+    INDIVIDUAL = "individual"
+    COMBINADA = "combinada"
+
+
+# =============================================================================
+# NIVELES Y CONFIANZA
+# =============================================================================
+
+class Confianza(str, Enum):
+    """Nivel de confianza en un pronóstico."""
+    BAJA = "baja"
+    MEDIA = "media"
+    ALTA = "alta"
+    
+    @classmethod
+    def desde_probabilidad(cls, prob: float) -> "Confianza":
+        """Determina el nivel de confianza según la probabilidad del modelo."""
+        if prob >= 0.70:
+            return cls.ALTA
+        elif prob >= 0.55:
+            return cls.MEDIA
+        return cls.BAJA
+
+
+class NivelRiesgo(str, Enum):
+    """Perfil de riesgo del usuario o de la apuesta."""
+    CONSERVADOR = "conservador"
+    MODERADO = "moderado"
+    AGRESIVO = "agresivo"
+
+
+# =============================================================================
+# ENTORNO Y COMPETICIÓN
+# =============================================================================
+
+class Entorno(str, Enum):
+    """Entorno de ejecución."""
+    DESARROLLO = "desarrollo"
+    PRODUCCION = "produccion"
+    TESTING = "testing"
+
+
+class TipoCompeticion(str, Enum):
+    """Tipo de competición donde se juega el partido."""
+    LIGA = "liga"
+    COPA = "copa"
+    AMISTOSO = "amistoso"
+    ELIMINATORIA = "eliminatoria"
+    SUPERCOPA = "supercopa"
+    CONTINENTAL = "continental"
+
+
+# =============================================================================
+# EXPORTS
+# =============================================================================
+
+__all__ = [
+    "Resultado",
+    "Mercado",
+    "DireccionLinea",
+    "EstadoEvento",
+    "EstadoPronostico",
+    "TipoApuesta",
+    "Confianza",
+    "NivelRiesgo",
+    "Entorno",
+    "TipoCompeticion",
+]===== ./models/__init__.py =====
+===== ./models/calibracion.py =====
+"""Calibracion de probabilidades con Isotonic Regression."""
+from __future__ import annotations
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+class Calibrador:
+    def __init__(self):
+        self.modelo = None
+        self.entrenado = False
+
+    def entrenar(self, probs_predichas: list, resultados_reales: list):
+        try:
+            from sklearn.isotonic import IsotonicRegression
+            self.modelo = IsotonicRegression(out_of_bounds="clip")
+            self.modelo.fit(probs_predichas, resultados_reales)
+            self.entrenado = True
+        except ImportError:
+            logger.warning("sklearn no instalado. Calibracion desactivada.")
+        except Exception as e:
+            logger.error(f"Error entrenando calibrador: {e}")
+
+    def calibrar(self, prob: float) -> float:
+        if not self.entrenado or self.modelo is None:
+            return prob
+        try:
+            return float(self.modelo.predict([prob])[0])
+        except Exception:
+            return prob
+
+    def brier_score(self, probs: list, resultados: list) -> float:
+        if not probs:
+            return 1.0
+        return sum((p - r) ** 2 for p, r in zip(probs, resultados)) / len(probs)
+
+__all__ = ["Calibrador"]
+===== ./models/dixon_coles.py =====
+"""Correccion Dixon-Coles para el modelo Poisson."""
+from __future__ import annotations
+import logging
+
+logger = logging.getLogger(__name__)
+
+RHO_DEFAULT = -0.10
+
+def factor_tau(x: int, y: int, lmbda: float, mu: float, rho: float = RHO_DEFAULT) -> float:
+    if x == 0 and y == 0:
+        return 1.0 - lmbda * mu * rho
+    elif x == 0 and y == 1:
+        return 1.0 + lmbda * rho
+    elif x == 1 and y == 0:
+        return 1.0 + mu * rho
+    elif x == 1 and y == 1:
+        return 1.0 - rho
+    return 1.0
+
+def aplicar_correccion(matriz, lmbda: float, mu: float, rho: float = RHO_DEFAULT):
+    for i in range(min(2, matriz.shape[0])):
+        for j in range(min(2, matriz.shape[1])):
+            tau = factor_tau(i, j, lmbda, mu, rho)
+            tau = max(tau, 0.001)
+            matriz[i, j] *= tau
+    total = matriz.sum()
+    if total > 0:
+        matriz = matriz / total
+    return matriz
+
+__all__ = ["factor_tau", "aplicar_correccion", "RHO_DEFAULT"]
+===== ./models/ensemble.py =====
+"""Combina predicciones de multiples modelos."""
+from __future__ import annotations
+import logging
+
+logger = logging.getLogger(__name__)
+
+PESOS_DEFAULT = {"poisson": 0.45, "pi_ratings": 0.30, "mercado": 0.25}
+
+def combinar_1x2(prob_poisson: dict, prob_pi: dict, prob_mercado: dict = None, pesos: dict = None) -> dict:
+    if pesos is None:
+        pesos = PESOS_DEFAULT
+
+    if prob_mercado is None:
+        total_activos = pesos["poisson"] + pesos["pi_ratings"]
+        pesos = {
+            "poisson": pesos["poisson"] / total_activos,
+            "pi_ratings": pesos["pi_ratings"] / total_activos,
+            "mercado": 0.0,
+        }
+
+    resultado = {"local": 0.0, "empate": 0.0, "visitante": 0.0}
+    for clave in resultado:
+        resultado[clave] = (
+            pesos["poisson"] * prob_poisson.get(clave, 0.0)
+            + pesos["pi_ratings"] * prob_pi.get(clave, 0.0)
+            + pesos.get("mercado", 0.0) * (prob_mercado or {}).get(clave, 0.0)
+        )
+
+    total = sum(resultado.values())
+    if total > 0:
+        resultado = {k: v / total for k, v in resultado.items()}
+    return resultado
+
+__all__ = ["combinar_1x2", "PESOS_DEFAULT"]
+===== ./models/goles.py =====
+"""Calculo de goles esperados por equipo."""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+PROMEDIO_LIGA = 1.35
+
+@dataclass
+class GolesEsperados:
+    lambda_local: float
+    lambda_visitante: float
+
+def calcular_lambda(
+    goles_favor_local: float,
+    goles_contra_local: float,
+    goles_favor_visitante: float,
+    goles_contra_visitante: float,
+    factor_localia: float = 1.15,
+) -> GolesEsperados:
+    ataque_local = max(goles_favor_local / PROMEDIO_LIGA, 0.1)
+    defensa_local = max(goles_contra_local / PROMEDIO_LIGA, 0.1)
+    ataque_visitante = max(goles_favor_visitante / PROMEDIO_LIGA, 0.1)
+    defensa_visitante = max(goles_contra_visitante / PROMEDIO_LIGA, 0.1)
+
+    lambda_local = ataque_local * defensa_visitante * PROMEDIO_LIGA * factor_localia
+    lambda_visitante = ataque_visitante * defensa_local * PROMEDIO_LIGA
+
+    lambda_local = max(0.3, min(lambda_local, 4.0))
+    lambda_visitante = max(0.3, min(lambda_visitante, 4.0))
+
+    return GolesEsperados(lambda_local=lambda_local, lambda_visitante=lambda_visitante)
+
+__all__ = ["calcular_lambda", "GolesEsperados", "PROMEDIO_LIGA"]
+===== ./models/pi_ratings.py =====
+"""Sistema de rating Pi para equipos de futbol."""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+K_FACTOR = 20.0
+HOME_ADVANTAGE = 100.0
+
+@dataclass
+class RatingEquipo:
+    nombre: str
+    rating: float = 1500.0
+    partidos: int = 0
+
+class PiRatings:
+    def __init__(self):
+        self.equipos: dict[str, RatingEquipo] = {}
+
+    def obtener(self, nombre: str) -> RatingEquipo:
+        if nombre not in self.equipos:
+            self.equipos[nombre] = RatingEquipo(nombre=nombre)
+        return self.equipos[nombre]
+
+    def probabilidad_local(self, local: str, visitante: str) -> float:
+        r_local = self.obtener(local).rating + HOME_ADVANTAGE
+        r_visitante = self.obtener(visitante).rating
+        return 1.0 / (1.0 + 10 ** ((r_visitante - r_local) / 400.0))
+
+    def actualizar(self, local: str, visitante: str, goles_local: int, goles_visitante: int):
+        eq_local = self.obtener(local)
+        eq_visitante = self.obtener(visitante)
+        prob_local = self.probabilidad_local(local, visitante)
+
+        if goles_local > goles_visitante:
+            resultado = 1.0
+        elif goles_local < goles_visitante:
+            resultado = 0.0
+        else:
+            resultado = 0.5
+
+        margen = abs(goles_local - goles_visitante)
+        factor_margen = (margen + 1) ** 0.5
+
+        cambio = K_FACTOR * factor_margen * (resultado - prob_local)
+
+        eq_local.rating += cambio
+        eq_visitante.rating -= cambio
+        eq_local.partidos += 1
+        eq_visitante.partidos += 1
+
+__all__ = ["PiRatings", "RatingEquipo", "K_FACTOR", "HOME_ADVANTAGE"]
+===== ./models/poisson_bivariante.py =====
+"""
+Modelo Poisson Bivariante con corrección Dixon-Coles.
+
+Este módulo implementa el modelo matemático principal para calcular
+probabilidades de resultados en partidos de fútbol.
+
+El modelo usa la distribución de Poisson para modelar los goles de cada
+equipo, y aplica la corrección de Dixon-Coles para ajustar las
+probabilidades de resultados con pocos goles (0-0, 1-0, 0-1, 1-1).
+
+Referencia:
+    Dixon, M. J., & Coles, S. G. (1997). Modelling Association Football
+    Scores and Inefficiencies in the Football Betting Market.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+from scipy.stats import poisson
+
+
+# =============================================================================
+# CONSTANTES
+# =============================================================================
+
+MAX_GOLES = 8  # Máximo de goles a considerar por equipo
+RHO_DIXON_COLES = -0.10  # Factor de correlación (valor típico: -0.10 a -0.15)
+
+
+# =============================================================================
+# ESTRUCTURAS DE DATOS
+# =============================================================================
+
+@dataclass
+class ParametrosPartido:
+    """Parámetros de entrada para calcular el modelo."""
+    lambda_local: float      # Goles esperados del equipo local
+    lambda_visitante: float  # Goles esperados del equipo visitante
+    rho: float = RHO_DIXON_COLES  # Factor Dixon-Coles
+
+    def __post_init__(self):
+        """Valida que los parámetros sean razonables."""
+        if self.lambda_local <= 0:
+            raise ValueError(f"lambda_local debe ser positivo, recibido: {self.lambda_local}")
+        if self.lambda_visitante <= 0:
+            raise ValueError(
+                f"lambda_visitante debe ser positivo, recibido: {self.lambda_visitante}"
+            )
+
+
+@dataclass
+class Probabilidades1X2:
+    """Probabilidades del mercado 1X2."""
+    local: float
+    empate: float
+    visitante: float
+
+    def __post_init__(self):
+        """Verifica que las probabilidades sumen ~1.0."""
+        total = self.local + self.empate + self.visitante
+        if not (0.99 <= total <= 1.01):
+            raise ValueError(f"Las probabilidades deben sumar 1.0, suma actual: {total}")
+
+
+# =============================================================================
+# FUNCIONES AUXILIARES
+# =============================================================================
+
+def _factor_tau(
+    x: int,
+    y: int,
+    lambda_local: float,
+    lambda_visitante: float,
+    rho: float,
+) -> float:
+    """
+    Calcula el factor de corrección Dixon-Coles para resultados bajos.
+
+    Este factor ajusta las probabilidades de 0-0, 1-0, 0-1, 1-1 que en el
+    modelo Poisson simple están subestimadas.
+
+    Args:
+        x: Goles del equipo local.
+        y: Goles del equipo visitante.
+        lambda_local: Goles esperados del local.
+        lambda_visitante: Goles esperados del visitante.
+        rho: Factor de correlación Dixon-Coles.
+
+    Returns:
+        Factor de corrección tau.
+    """
+    if x == 0 and y == 0:
+        return 1 - lambda_local * lambda_visitante * rho
+    elif x == 0 and y == 1:
+        return 1 + lambda_local * rho
+    elif x == 1 and y == 0:
+        return 1 + lambda_visitante * rho
+    elif x == 1 and y == 1:
+        return 1 - rho
+    return 1.0
+
+
+# =============================================================================
+# MODELO PRINCIPAL
+# =============================================================================
+
+class PoissonBivariante:
+    """
+    Modelo Poisson Bivariante con corrección Dixon-Coles.
+
+    Uso:
+        modelo = PoissonBivariante()
+        probs = modelo.calcular_probabilidades(1.65, 1.10)
+
+    Atributos:
+        max_goles: Número máximo de goles a considerar por equipo.
+        rho: Factor de correlación Dixon-Coles por defecto.
+    """
+
+    def __init__(
+        self,
+        max_goles: int = MAX_GOLES,
+        rho: float = RHO_DIXON_COLES,
+    ):
+        """
+        Inicializa el modelo.
+
+        Args:
+            max_goles: Máximo de goles por equipo (default: 8).
+            rho: Factor Dixon-Coles (default: -0.10).
+        """
+        self.max_goles = max_goles
+        self.rho = rho
+
+    def calcular_matriz(
+        self,
+        lambda_local: float,
+        lambda_visitante: float,
+        rho: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Calcula la matriz de probabilidades para todos los resultados.
+
+        Args:
+            lambda_local: Goles esperados del local.
+            lambda_visitante: Goles esperados del visitante.
+            rho: Factor Dixon-Coles (usa el de la instancia si es None).
+
+        Returns:
+            Matriz de tamaño (max_goles+1) x (max_goles+1) donde
+            matriz[i, j] = P(local marca i goles Y visitante marca j goles).
+
+        Raises:
+            ValueError: Si los parámetros son inválidos.
+        """
+        if rho is None:
+            rho = self.rho
+
+        # Validar parámetros
+        if lambda_local <= 0 or lambda_visitante <= 0:
+            raise ValueError(
+                f"Los lambdas deben ser positivos. "
+                f"Recibidos: local={lambda_local}, visitante={lambda_visitante}"
+            )
+
+        n = self.max_goles + 1
+        matriz = np.zeros((n, n))
+
+        for i in range(n):
+            for j in range(n):
+                # Probabilidad Poisson simple
+                p_local = poisson.pmf(i, lambda_local)
+                p_visitante = poisson.pmf(j, lambda_visitante)
+
+                # Aplicar corrección Dixon-Coles
+                tau = _factor_tau(i, j, lambda_local, lambda_visitante, rho)
+
+                # Asegurar que tau sea positivo (evitar valores negativos)
+                tau = max(tau, 0.0)
+
+                matriz[i, j] = p_local * p_visitante * tau
+
+        # Normalizar la matriz para que sume 1.0
+        suma = matriz.sum()
+        if suma > 0:
+            matriz = matriz / suma
+
+        return matriz
+
+    def calcular_1x2(
+        self,
+        lambda_local: float,
+        lambda_visitante: float,
+        rho: Optional[float] = None,
+    ) -> Probabilidades1X2:
+        """
+        Calcula las probabilidades del mercado 1X2.
+
+        Args:
+            lambda_local: Goles esperados del local.
+            lambda_visitante: Goles esperados del visitante.
+            rho: Factor Dixon-Coles.
+
+        Returns:
+            Probabilidades1X2 con probabilidades de local, empate, visitante.
+        """
+        matriz = self.calcular_matriz(lambda_local, lambda_visitante, rho)
+
+        # Sumar probabilidades según el resultado
+        p_local = 0.0
+        p_empate = 0.0
+        p_visitante = 0.0
+
+        for i in range(matriz.shape[0]):
+            for j in range(matriz.shape[1]):
+                if i > j:
+                    p_local += matriz[i, j]
+                elif i == j:
+                    p_empate += matriz[i, j]
+                else:
+                    p_visitante += matriz[i, j]
+
+        return Probabilidades1X2(
+            local=float(p_local),
+            empate=float(p_empate),
+            visitante=float(p_visitante),
+        )
+
+    def calcular_over_under(
+        self,
+        lambda_local: float,
+        lambda_visitante: float,
+        linea: float = 2.5,
+        rho: Optional[float] = None,
+    ) -> tuple[float, float]:
+        """
+        Calcula las probabilidades de Over/Under para una línea de goles.
+
+        Args:
+            lambda_local: Goles esperados del local.
+            lambda_visitante: Goles esperados del visitante.
+            linea: Línea de goles (2.5 es la más común).
+            rho: Factor Dixon-Coles.
+
+        Returns:
+            Tupla (prob_over, prob_under).
+        """
+        matriz = self.calcular_matriz(lambda_local, lambda_visitante, rho)
+
+        p_over = 0.0
+        for i in range(matriz.shape[0]):
+            for j in range(matriz.shape[1]):
+                if i + j > linea:
+                    p_over += matriz[i, j]
+
+        p_under = 1.0 - p_over
+        return (float(p_over), float(p_under))
+
+    def calcular_btts(
+        self,
+        lambda_local: float,
+        lambda_visitante: float,
+        rho: Optional[float] = None,
+    ) -> tuple[float, float]:
+        """
+        Calcula las probabilidades de "Ambos Marcan" (BTTS).
+
+        Args:
+            lambda_local: Goles esperados del local.
+            lambda_visitante: Goles esperados del visitante.
+            rho: Factor Dixon-Coles.
+
+        Returns:
+            Tupla (prob_si, prob_no).
+        """
+        matriz = self.calcular_matriz(lambda_local, lambda_visitante, rho)
+
+        # BTTS Sí = ambos equipos marcan al menos 1 gol
+        p_si = 0.0
+        for i in range(1, matriz.shape[0]):
+            for j in range(1, matriz.shape[1]):
+                p_si += matriz[i, j]
+
+        p_no = 1.0 - p_si
+        return (float(p_si), float(p_no))
+
+    def calcular_score_exacto(
+        self,
+        lambda_local: float,
+        lambda_visitante: float,
+        goles_local: int,
+        goles_visitante: int,
+        rho: Optional[float] = None,
+    ) -> float:
+        """
+        Calcula la probabilidad de un marcador exacto.
+
+        Args:
+            lambda_local: Goles esperados del local.
+            lambda_visitante: Goles esperados del visitante.
+            goles_local: Goles exactos del local.
+            goles_visitante: Goles exactos del visitante.
+            rho: Factor Dixon-Coles.
+
+        Returns:
+            Probabilidad del marcador exacto.
+        """
+        if goles_local > self.max_goles or goles_visitante > self.max_goles:
+            return 0.0
+
+        matriz = self.calcular_matriz(lambda_local, lambda_visitante, rho)
+        return float(matriz[goles_local, goles_visitante])
+
+    def calcular_todos_los_mercados(
+        self,
+        lambda_local: float,
+        lambda_visitante: float,
+        rho: Optional[float] = None,
+    ) -> dict:
+        """
+        Calcula todos los mercados principales de una vez.
+
+        Returns:
+            Diccionario con todas las probabilidades organizadas por mercado.
+        """
+        p1x2 = self.calcular_1x2(lambda_local, lambda_visitante, rho)
+        p_over25, p_under25 = self.calcular_over_under(
+            lambda_local, lambda_visitante, 2.5, rho
+        )
+        p_over15, p_under15 = self.calcular_over_under(
+            lambda_local, lambda_visitante, 1.5, rho
+        )
+        p_over35, p_under35 = self.calcular_over_under(
+            lambda_local, lambda_visitante, 3.5, rho
+        )
+        p_btts_si, p_btts_no = self.calcular_btts(
+            lambda_local, lambda_visitante, rho
+        )
+
+        return {
+            "1x2": {
+                "local": p1x2.local,
+                "empate": p1x2.empate,
+                "visitante": p1x2.visitante,
+            },
+            "over_under": {
+                "over_1_5": p_over15,
+                "under_1_5": p_under15,
+                "over_2_5": p_over25,
+                "under_2_5": p_under25,
+                "over_3_5": p_over35,
+                "under_3_5": p_under35,
+            },
+            "ambos_marcan": {
+                "si": p_btts_si,
+                "no": p_btts_no,
+            },
+        }
+
+
+# =============================================================================
+# FUNCIONES DE CONVENIENCIA
+# =============================================================================
+
+def calcular_probabilidades(
+    lambda_local: float,
+    lambda_visitante: float,
+    rho: float = RHO_DIXON_COLES,
+) -> dict:
+    """
+    Función de conveniencia para calcular todas las probabilidades.
+
+    Args:
+        lambda_local: Goles esperados del local.
+        lambda_visitante: Goles esperados del visitante.
+        rho: Factor Dixon-Coles.
+
+    Returns:
+        Diccionario con todas las probabilidades.
+    """
+    modelo = PoissonBivariante(rho=rho)
+    return modelo.calcular_todos_los_mercados(lambda_local, lambda_visitante)
+
+
+__all__ = [
+    "PoissonBivariante",
+    "ParametrosPartido",
+    "Probabilidades1X2",
+    "calcular_probabilidades",
+    "MAX_GOLES",
+    "RHO_DIXON_COLES",
+]===== ./tests/__init__.py =====
+===== ./tests/test_agente.py =====
+"""Tests para el agente orquestador."""
+import pytest
+from agent.validacion import validar_texto, ConsultaPartido, ValidacionError
+from agent.orquestador import Orquestador, RespuestaPronostico
+
+def test_validar_formato_vs():
+    c = validar_texto("Real Madrid vs Barcelona")
+    assert c.local == "Real Madrid"
+    assert c.visitante == "Barcelona"
+
+def test_validar_formato_guion():
+    c = validar_texto("Real Madrid - Barcelona")
+    assert c.local == "Real Madrid"
+    assert c.visitante == "Barcelona"
+
+def test_validar_texto_vacio():
+    with pytest.raises(ValidacionError):
+        validar_texto("")
+
+def test_validar_formato_invalido():
+    with pytest.raises(ValidacionError):
+        validar_texto("texto sin separador")
+
+def test_orquestador_procesa():
+    orq = Orquestador()
+    r = orq.procesar("Real Madrid vs Barcelona", guardar=False)
+    assert isinstance(r, RespuestaPronostico)
+    assert r.local == "Real Madrid"
+    assert "local" in r.probabilidades
+
+def test_orquestador_probabilidades_validas():
+    orq = Orquestador()
+    r = orq.procesar("Equipo A vs Equipo B", guardar=False)
+    total = sum(r.probabilidades.values())
+    assert 0.99 <= total <= 1.01
+
+__all__ = []
+===== ./tests/test_auditoria.py =====
+"""Tests para el motor regenerativo (auditoria)."""
+import pytest
+from auditoria.metricas import CalculadoraMetricas, Metricas
+from auditoria.calibrador import CalibradorAutomatico
+from auditoria.ajustador_pesos import AjustadorPesos, PESOS_INICIALES
+
+def test_metricas_vacio():
+    calc = CalculadoraMetricas()
+    m = calc.calcular()
+    assert isinstance(m, Metricas)
+    assert m.total >= 0
+
+def test_calibrador_sin_entrenar():
+    cal = CalibradorAutomatico()
+    prob = cal.calibrar(0.60)
+    assert prob == 0.60
+
+def test_ajustador_pesos_iniciales():
+    aj = AjustadorPesos()
+    assert "poisson" in aj.pesos
+    assert "pi_ratings" in aj.pesos
+    assert "mercado" in aj.pesos
+
+def test_ajustador_suma_uno():
+    aj = AjustadorPesos()
+    total = sum(aj.pesos.values())
+    assert 0.99 <= total <= 1.01
+
+def test_ajustador_brier_alto_baja_peso():
+    aj = AjustadorPesos()
+    peso_inicial = aj.pesos["poisson"]
+    aj.ajustar({"poisson": 0.35})
+    assert aj.pesos["poisson"] <= peso_inicial
+
+__all__ = []
+===== ./tests/test_betting.py =====
+"""Tests para el modulo de apuestas."""
+import pytest
+from betting.value_betting import DetectorValue
+from betting.bankroll import GestorBankroll
+from betting.combinadas import GeneradorCombinadas
+
+def test_value_betting_ev_positivo():
+    detector = DetectorValue()
+    ev = detector.calcular_ev(0.60, 2.0)
+    assert ev == pytest.approx(0.20, abs=0.01)
+
+def test_value_betting_ev_negativo():
+    detector = DetectorValue()
+    ev = detector.calcular_ev(0.40, 2.0)
+    assert ev < 0
+
+def test_value_betting_detecta():
+    detector = DetectorValue()
+    probs = {"1x2": {"local": 0.60, "empate": 0.25, "visitante": 0.15}}
+    cuotas = {"1x2": {"local": 2.0, "empate": 3.5, "visitante": 5.0}}
+    vb = detector.detectar(probs, cuotas)
+    assert len(vb) >= 1
+
+def test_bankroll_kelly_basico():
+    gestor = GestorBankroll(1000.0)
+    apuesta = gestor.calcular_stake(0.60, 2.0)
+    assert apuesta.stake > 0
+    assert apuesta.stake <= 50.0
+
+def test_bankroll_probabilidad_baja():
+    gestor = GestorBankroll(1000.0)
+    apuesta = gestor.calcular_stake(0.30, 1.5)
+    assert apuesta.stake == 0.0
+
+def test_combinadas_minimo_dos_picks():
+    gen = GeneradorCombinadas()
+    candidatos = [
+        {"mercado": "over_2_5", "probabilidad": 0.65, "cuota": 1.70},
+        {"mercado": "btts", "probabilidad": 0.60, "cuota": 1.80},
+    ]
+    comb = gen.generar(candidatos)
+    assert len(comb.picks) >= 2
+    assert comb.cuota_total >= 1.50
+
+def test_combinadas_pocos_candidatos():
+    gen = GeneradorCombinadas()
+    candidatos = [{"mercado": "x", "probabilidad": 0.60, "cuota": 1.50}]
+    comb = gen.generar(candidatos)
+    assert len(comb.picks) == 0
+
+__all__ = []
+===== ./tests/test_modelos.py =====
+"""Tests para los modelos matematicos."""
+import pytest
+from models.poisson_bivariante import PoissonBivariante
+from models.pi_ratings import PiRatings
+from models.goles import calcular_lambda
+from models.dixon_coles import factor_tau
+
+def test_poisson_1x2_suma_uno():
+    modelo = PoissonBivariante()
+    probs = modelo.calcular_1x2(1.5, 1.2)
+    total = probs.local + probs.empate + probs.visitante
+    assert 0.99 <= total <= 1.01
+
+def test_poisson_matriz_suma_uno():
+    modelo = PoissonBivariante()
+    matriz = modelo.calcular_matriz(1.5, 1.2)
+    assert 0.99 <= matriz.sum() <= 1.01
+
+def test_poisson_lambda_invalido():
+    modelo = PoissonBivariante()
+    with pytest.raises(ValueError):
+        modelo.calcular_matriz(-1.0, 1.2)
+
+def test_pi_ratings_probabilidad():
+    ratings = PiRatings()
+    prob = ratings.probabilidad_local("Equipo A", "Equipo B")
+    assert 0.0 <= prob <= 1.0
+
+def test_pi_ratings_actualizar():
+    ratings = PiRatings()
+    r1 = ratings.obtener("A").rating
+    ratings.actualizar("A", "B", 3, 0)
+    r2 = ratings.obtener("A").rating
+    assert r2 > r1
+
+def test_goles_lambda_rango():
+    r = calcular_lambda(1.5, 1.2, 1.3, 1.4)
+    assert 0.3 <= r.lambda_local <= 4.0
+    assert 0.3 <= r.lambda_visitante <= 4.0
+
+def test_dixon_coles_factor():
+    tau = factor_tau(0, 0, 1.5, 1.2, -0.10)
+    assert tau > 0
+
+def test_dixon_coles_marcador_alto():
+    tau = factor_tau(3, 2, 1.5, 1.2, -0.10)
+    assert tau == 1.0
+
+__all__ = []
+===== ./utils/__init__.py =====
+===== ./utils/config.py =====
+"""Configuracion centralizada del bot."""
+from __future__ import annotations
+import os
+import logging
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Config:
+    telegram_token: str = ""
+    bzzoiro_api_key: str = ""
+    database_url: str = "sqlite:///bot.db"
+    log_level: str = "INFO"
+    debug: bool = False
+    bankroll_inicial: float = 1000.0
+    kelly_fraccion: float = 0.25
+    ev_minimo: float = 0.03
+    max_goles: int = 8
+    rho_dixon_coles: float = -0.10
+
+def cargar_config() -> Config:
+    return Config(
+        telegram_token=os.getenv("TELEGRAM_TOKEN", ""),
+        bzzoiro_api_key=os.getenv("BZZOIRO_API_KEY", ""),
+        database_url=os.getenv("DATABASE_URL", "sqlite:///bot.db"),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        debug=os.getenv("DEBUG", "false").lower() == "true",
+    )
+
+__all__ = ["Config", "cargar_config"]
+===== ./utils/helpers.py =====
+"""Funciones auxiliares comunes."""
+from __future__ import annotations
+import re
+from datetime import datetime
+from typing import Optional
+
+def limpiar_nombre_equipo(nombre: str) -> str:
+    if not nombre:
+        return ""
+    nombre = re.sub(r"\s+", " ", nombre)
+    return nombre.strip()
+
+def formatear_fecha(fecha: Optional[datetime]) -> str:
+    if fecha is None:
+        return "Sin fecha"
+    return fecha.strftime("%d/%m/%Y %H:%M")
+
+def porcentaje(valor: float) -> str:
+    return f"{valor * 100:.1f}%"
+
+def redondear(valor: float, decimales: int = 2) -> float:
+    return round(valor, decimales)
+
+def calcular_probabilidad_implicita(cuota: float) -> float:
+    if cuota <= 1.0:
+        return 0.0
+    return 1.0 / cuota
+
+def calcular_valor_esperado(prob: float, cuota: float) -> float:
+    return (prob * cuota) - 1.0
+
+__all__ = [
+    "limpiar_nombre_equipo",
+    "formatear_fecha",
+    "porcentaje",
+    "redondear",
+    "calcular_probabilidad_implicita",
+    "calcular_valor_esperado",
+]
+===== ./utils/logger.py =====
+"""Configuracion centralizada de logs."""
+from __future__ import annotations
+import logging
+import sys
+from pathlib import Path
+
+LOG_DIR = Path("logs")
+LOG_FILE = LOG_DIR / "bot.log"
+
+def configurar_logs(nivel: str = "INFO") -> logging.Logger:
+    LOG_DIR.mkdir(exist_ok=True)
+
+    formato = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+
+    logger_root = logging.getLogger()
+    logger_root.setLevel(getattr(logging, nivel.upper(), logging.INFO))
+
+    if logger_root.handlers:
+        logger_root.handlers.clear()
+
+    consola = logging.StreamHandler(sys.stdout)
+    consola.setFormatter(logging.Formatter(formato))
+    logger_root.addHandler(consola)
+
+    archivo = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    archivo.setFormatter(logging.Formatter(formato))
+    logger_root.addHandler(archivo)
+
+    return logger_root
+
+def obtener_logger(nombre: str) -> logging.Logger:
+    return logging.getLogger(nombre)
+
+__all__ = ["configurar_logs", "obtener_logger", "LOG_FILE"]
+===== ./utils/rate_limiter.py =====
+"""Control de rate limiting para APIs externas."""
+from __future__ import annotations
+import logging
+from datetime import date, datetime
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class LimiteAPI:
+    nombre: str
+    max_por_dia: int
+    max_por_minuto: int = 60
+    usados_hoy: int = 0
+    fecha_actual: date = field(default_factory=date.today)
+    ultima_peticion: datetime = field(default_factory=datetime.now)
+
+class RateLimiter:
+    def __init__(self):
+        self.limites: dict[str, LimiteAPI] = {}
+
+    def registrar(self, nombre: str, max_por_dia: int, max_por_minuto: int = 60):
+        self.limites[nombre] = LimiteAPI(
+            nombre=nombre,
+            max_por_dia=max_por_dia,
+            max_por_minuto=max_por_minuto,
+        )
+
+    def _actualizar_fecha(self, lim: LimiteAPI):
+        hoy = date.today()
+        if lim.fecha_actual != hoy:
+            lim.usados_hoy = 0
+            lim.fecha_actual = hoy
+
+    def puede_consultar(self, nombre: str) -> bool:
+        lim = self.limites.get(nombre)
+        if not lim:
+            return True
+        self._actualizar_fecha(lim)
+        return lim.usados_hoy < lim.max_por_dia
+
+    def registrar_uso(self, nombre: str):
+        lim = self.limites.get(nombre)
+        if not lim:
+            return
+        self._actualizar_fecha(lim)
+        lim.usados_hoy += 1
+        lim.ultima_peticion = datetime.now()
+
+    def restantes(self, nombre: str) -> int:
+        lim = self.limites.get(nombre)
+        if not lim:
+            return -1
+        self._actualizar_fecha(lim)
+        return max(0, lim.max_por_dia - lim.usados_hoy)
+
+__all__ = ["RateLimiter", "LimiteAPI"]
+===== ./vision/__init__.py =====
+===== ./vision/ocr_reader.py =====
+"""Lee texto de imagenes de partidos usando OCR."""
+from __future__ import annotations
+import logging
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class InfoPartido:
+    local: str
+    visitante: str
+    liga: Optional[str] = None
+    fecha: Optional[str] = None
+    exito: bool = True
+    error: Optional[str] = None
+
+class LectorOCR:
+    def __init__(self):
+        self.reader = None
+
+    def _inicializar(self):
+        if self.reader is None:
+            try:
+                import easyocr
+                self.reader = easyocr.Reader(["es", "en"], gpu=False)
+            except ImportError:
+                logger.warning("easyocr no instalado")
+                self.reader = False
+
+    def extraer_texto(self, ruta: str) -> str:
+        self._inicializar()
+        if not self.reader:
+            return ""
+        try:
+            resultados = self.reader.readtext(ruta)
+            return " ".join(r[1] for r in resultados)
+        except Exception as e:
+            logger.error(f"Error OCR: {e}")
+            return ""
+
+    def extraer_partido(self, ruta: str) -> InfoPartido:
+        texto = self.extraer_texto(ruta)
+        if not texto:
+            return InfoPartido(local="", visitante="", exito=False, error="OCR fallo")
+
+        patrones = [
+            r"([A-Za-z\s]+?)\s+(?:vs|VS|v\.|contra)\s+([A-Za-z\s]+)",
+            r"([A-Za-z\s]+?)\s+-\s+([A-Za-z\s]+)",
+        ]
+
+        for patron in patrones:
+            m = re.search(patron, texto)
+            if m:
+                return InfoPartido(
+                    local=m.group(1).strip(),
+                    visitante=m.group(2).strip(),
+                )
+
+        return InfoPartido(local="", visitante="", exito=False, error="Formato no detectado")
+
+__all__ = ["LectorOCR", "InfoPartido"]
