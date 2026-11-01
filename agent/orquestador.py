@@ -1,9 +1,10 @@
-"""Orquestador Definitivo con Búsqueda Agresiva de Hora."""
+"""Orquestador Definitivo con conversion de hora a Peru (UTC-5)."""
 from __future__ import annotations
 import logging
 import os
 import unicodedata
 import datetime
+import pytz
 from dataclasses import dataclass, field
 from typing import Optional
 import httpx
@@ -46,18 +47,32 @@ class Orquestador:
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
 
     def _extraer_hora(self, ev: dict) -> str:
-        # Busca cualquier llave que tenga "date" o "time"
-        for key, val in ev.items():
-            if "date" in key.lower() or "time" in key.lower():
-                if val:
-                    try:
-                        if isinstance(val, (int, float)):
-                            return datetime.datetime.fromtimestamp(val).strftime("%H:%M")
-                        elif isinstance(val, str) and "T" in val:
-                            return val[11:16]
-                        elif isinstance(val, str) and ":" in val:
-                            return val[:5]
-                    except: pass
+        val = ev.get("event_date")
+        if val:
+            try:
+                # Si es un string en formato ISO (2026-10-31T19:00:00Z)
+                if isinstance(val, str) and ("T" in val or "-" in val):
+                    # Convertir Z a +00:00 para que datetime lo entienda
+                    iso_str = val.replace("Z", "+00:00")
+                    dt_utc = datetime.datetime.fromisoformat(iso_str)
+                    
+                    # Si la fecha no tiene zona horaria, asumimos que es UTC
+                    if dt_utc.tzinfo is None:
+                        dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
+                        
+                    # Convertir a hora de Perú (America/Lima)
+                    tz_peru = pytz.timezone('America/Lima')
+                    dt_peru = dt_utc.astimezone(tz_peru)
+                    
+                    return dt_peru.strftime("%H:%M")
+                
+                # Si es un timestamp
+                elif isinstance(val, (int, float)):
+                    dt_utc = datetime.datetime.fromtimestamp(val, tz=datetime.timezone.utc)
+                    tz_peru = pytz.timezone('America/Lima')
+                    return dt_utc.astimezone(tz_peru).strftime("%H:%M")
+            except Exception as e:
+                logger.error(f"Error procesando hora: {e}")
         return ""
 
     async def obtener_partidos_disponibles(self, limite: int = 20) -> list:
