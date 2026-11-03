@@ -1,4 +1,4 @@
-"""Conexion a base de datos con diagnostico."""
+"""Conexion a base de datos con pg8000 (sin compilacion)."""
 from __future__ import annotations
 import os
 import logging
@@ -7,26 +7,13 @@ from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 logger = logging.getLogger(__name__)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///bot.db")
 
-if not DATABASE_URL:
-    logger.error("❌ CRÍTICO: La variable DATABASE_URL no está configurada en Railway.")
-    DATABASE_URL = "sqlite:///bot.db"
-else:
-    if DATABASE_URL.startswith("postgres://"):
-        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    
-    # Ocultar la contraseña en los logs por seguridad
-    try:
-        if "@" in DATABASE_URL:
-            parte_segura = DATABASE_URL.split('@')[0].split(':')[0]
-            url_log = parte_segura + ":***@" + DATABASE_URL.split('@')[1]
-        else:
-            url_log = DATABASE_URL
-    except:
-        url_log = "URL_MAL_FORMADA"
-
-    logger.info(f"🔗 CONECTANDO A DB: {url_log}")
+# Si es una URL de PostgreSQL, forzamos el uso de pg8000
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+pg8000://", 1)
+elif DATABASE_URL.startswith("postgresql://") and "+pg8000" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+pg8000://", 1)
 
 class Base(DeclarativeBase):
     pass
