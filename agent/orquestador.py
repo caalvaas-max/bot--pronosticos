@@ -1,4 +1,4 @@
-"""Orquestador Definitivo con conversion de hora a Peru (UTC-5)."""
+"""Orquestador Definitivo con Guardado en Base de Datos."""
 from __future__ import annotations
 import logging
 import os
@@ -14,6 +14,7 @@ from models.poisson_bivariante import PoissonBivariante
 from models.goles import calcular_lambda
 from models.pi_ratings import PiRatings
 from models.ensemble import combinar_1x2
+from auditoria.guardar import GuardadorPronosticos, DatosPronostico
 
 logger = logging.getLogger(__name__)
 BASE_URL = "https://sports.bzzoiro.com/api/v2"
@@ -45,39 +46,34 @@ class Orquestador:
         self.poisson = PoissonBivariante()
         self.pi_ratings = PiRatings()
         self.api_key = os.getenv("BZZOIRO_API_KEY", "")
+        self.guardador = GuardadorPronosticos()
 
-    def _extraer_hora(self, ev: dict) -> str:
+    def _extraer_hora(self, ev: dict) -> tuple[str, datetime.datetime]:
         val = ev.get("event_date")
+        dt_peru = None
+        hora_str = ""
         if val:
             try:
-                # Si es un string en formato ISO (2026-10-31T19:00:00Z)
                 if isinstance(val, str) and ("T" in val or "-" in val):
-                    # Convertir Z a +00:00 para que datetime lo entienda
                     iso_str = val.replace("Z", "+00:00")
                     dt_utc = datetime.datetime.fromisoformat(iso_str)
-                    
-                    # Si la fecha no tiene zona horaria, asumimos que es UTC
                     if dt_utc.tzinfo is None:
                         dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
-                        
-                    # Convertir a hora de Perú (America/Lima)
-                    tz_peru = pytz.timezone('America/Lima')
-                    dt_peru = dt_utc.astimezone(tz_peru)
-                    
-                    return dt_peru.strftime("%H:%M")
-                
-                # Si es un timestamp
+                    dt_peru = dt_utc.astimezone(pytz.timezone('America/Lima'))
+                    hora_str = dt_peru.strftime("%H:%M")
                 elif isinstance(val, (int, float)):
                     dt_utc = datetime.datetime.fromtimestamp(val, tz=datetime.timezone.utc)
-                    tz_peru = pytz.timezone('America/Lima')
-                    return dt_utc.astimezone(tz_peru).strftime("%H:%M")
+                    dt_peru = dt_utc.astimezone(pytz.timezone('America/Lima'))
+                    hora_str = dt_peru.strftime("%H:%M")
             except Exception as e:
                 logger.error(f"Error procesando hora: {e}")
-        return ""
+        return hora_str, dt_peru
 
     async def obtener_partidos_disponibles(self, limite: int = 20) -> list:
         if not self.api_key: return []
         headers = {"Authorization": f"Token {self.api_key}", "User-Agent": "Mozilla/5.0"}
+        ahora = datetime.datetime.now(pytz.timezone('America/Lima'))
+        
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
                 r = await c.get(f"{BASE_URL}/predictions/", headers=headers, params={"limit": limite})
@@ -88,9 +84,13 @@ class Orquestador:
                         ev = item.get("event", {})
                         h = ev.get("home_team", "")
                         a = ev.get("away_team", "")
-                        hora = self._extraer_hora(ev)
+                        hora_str, dt_peru = self._extraer_hora(ev)
+                        
+                        if dt_peru and dt_peru < ahora:
+                            continue
+                            
                         if h and a:
-                            partidos.append({"texto": f"{h} vs {a}", "hora": hora})
+                            partidos.append({"texto": f"{h} vs {a}", "hora": hora_str})
                     return partidos
         except Exception as e:
             logger.error(f"Error obteniendo partidos: {e}")
@@ -134,7 +134,7 @@ class Orquestador:
         if "success" in res:
             fuente = "BZZOIRO"
             ev_data = res["data"].get("event", {})
-            hora_partido = self._extraer_hora(ev_data)
+            hora_partido, _ = self._extraer_hora(ev_data)
             mkts = res["data"].get("markets", {})
             
             mr = mkts.get("match_result", {})
@@ -203,9 +203,33 @@ class Orquestador:
         max_prob = max(probs_final.values())
         confianza = "alta" if max_prob > 0.55 else ("media" if max_prob > 0.45 else "baja")
 
-        return RespuestaPronostico(
+        respuesta = RespuestaPronostico(
             local=consulta.local, visitante=consulta.visitante, hora=hora_partido,
             probabilidades=probs_final, mercados=mercados,
             confianza=confianza, marcador_top=mejor_marcador,
             marcador_prob=mejor_prob, fuente=fuente,
         )
+
+        # ¡AQUÍ ESTÁ LA ORDEN DE GUARDAR EN SUPABASE!
+        if guardar:
+            top_sel = max(probs_final, key=probs_final.get)
+            prob_top = probs_final[top_sel]
+            seleccion_txt = "Local" if top_sel == "local" else ("Empate" if top_sel == "empate" else "Visita")
+            
+            datos_guardar = DatosPronostico(
+                evento_id=f"{consulta.local}_vs_{consulta.visitante}",
+                liga="Bzzoiro",
+                local=consulta.local,
+                visitante=consulta.visitante,
+                mercado="1x2",
+                seleccion=seleccion_txt,
+                probabilidad=prob_top,
+                confianza=confianza
+            )
+            try:
+                self.guardador.guardar(datos_guardar)
+                logger.info(f"✅ Pronóstico guardado en DB: {consulta.local} vs {consulta.visitante}")
+            except Exception as e:
+                logger.error(f"❌ Error guardando en DB: {e}")
+
+        return respuesta
