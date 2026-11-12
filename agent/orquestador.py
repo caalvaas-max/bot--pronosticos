@@ -12,7 +12,7 @@ import httpx
 from agent.validacion import validar_texto
 from models.poisson_bivariante import PoissonBivariante
 from models.goles import calcular_lambda
-from models.pi_ratings import P1Ratings
+from models.pi_ratings import PiRatings
 from models.ensemble import combinar_1x2
 from auditoria.guardar import GuardadorPronosticos, DatosPronostico
 
