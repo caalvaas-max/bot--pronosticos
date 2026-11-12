@@ -63,7 +63,7 @@ class Orquestador:
                             continue
 
                         if h and a:
-                            liga_nombre = ev.get("league", {}).get("name", "Otra Liga") if isinstance(ev.get("league"), dict) else str(ev.get("league", "Otra Liga"))
+                            liga_nombre = ev.get("league_name", "Otra Liga")
                             genero = str(ev.get("gender", "M"))
                             partidos.append({
                                 "texto": f"{h} vs {a}", 
@@ -100,7 +100,7 @@ class Orquestador:
         return {"error": "Partido no encontrado"}
 
     def _extraer_hora(self, ev: dict) -> tuple:
-        fecha_str = ev.get("date") or ev.get("start_time") or ev.get("kickoff")
+        fecha_str = ev.get("event_date")
         if not fecha_str: return "?", None
         try:
             fecha_str = str(fecha_str).replace('Z', '+00:00')
@@ -109,7 +109,7 @@ class Orquestador:
                 dt = dt.replace(tzinfo=pytz.UTC)
             dt_peru = dt.astimezone(pytz.timezone('America/Lima'))
             return dt_peru.strftime("%H:%M"), dt_peru
-        except:
+        except Exception as e:
             return "?", None
 
     async def generar_pronostico(self, local: str, visitante: str) -> Optional[RespuestaPronostico]:
