@@ -69,25 +69,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pronostico = await orquestador.generar_pronostico(partido['local'], partido['visitante'])
             
             if pronostico:
-                # 1. Recopilar todas las probabilidades en una lista
                 todos_los_picks = []
                 
-                # Añadir 1X2
                 p_1x2 = pronostico.probabilidades
                 for sel, prob in p_1x2.items():
                     nombre_sel = pronostico.local if sel == '1' else 'Empate' if sel == 'X' else pronostico.visitante
                     todos_los_picks.append((prob, f"Gana {nombre_sel}"))
                 
-                # Añadir mercados secundarios
                 for nombre_mercado, opciones in pronostico.mercados.items():
-                    if nombre_mercado == "1X2" or opciones == "NO RECOMENDADO":
+                    if nombre_mercado == "1X2":
                         continue
                     
                     if isinstance(opciones, dict):
                         for sel, prob in opciones.items():
                             todos_los_picks.append((prob, f"{nombre_mercado} - {sel}"))
                     elif isinstance(opciones, str):
-                        # Extraer el porcentaje de string tipo "Over 1.5 (74.3%)"
                         try:
                             nombre = opciones.split(" (")[0]
                             prob_str = opciones.split("(")[1].replace("%)", "")
@@ -96,22 +92,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         except:
                             pass
                 
-                # 2. Ordenar de mayor a menor y sacar el Top 3
                 todos_los_picks.sort(key=lambda x: x[0], reverse=True)
                 top_3 = todos_los_picks[:3]
 
-                # 3. Construir el mensaje
                 texto_final = f"⚽ <b>{pronostico.local} vs {pronostico.visitante}</b>\n\n"
                 
-                # Añadir TOP PICKS en negrita arriba
                 texto_final += "🔥 <b>TOP PICKS:</b>\n"
                 for prob, nombre in top_3:
                     texto_final += f"• <b>{nombre}: {prob*100:.1f}%</b>\n"
                 texto_final += "\n"
                 
-                # Añadir el desglose completo
                 texto_final += "📊 <b>Desglose:</b>\n"
-                
                 texto_final += f"🏠 Gana {pronostico.local}: {p_1x2.get('1', 0)*100:.1f}%\n"
                 texto_final += f"🤝 Empate: {p_1x2.get('X', 0)*100:.1f}%\n"
                 texto_final += f"✈️ Gana {pronostico.visitante}: {p_1x2.get('2', 0)*100:.1f}%\n\n"
@@ -119,10 +110,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for nombre_mercado, opciones in pronostico.mercados.items():
                     if nombre_mercado == "1X2":
                         continue
-                        
-                    if opciones == "NO RECOMENDADO":
-                        texto_final += f"⚠️ <b>{nombre_mercado}:</b> NO RECOMENDADO (Faltan datos)\n\n"
-                    elif isinstance(opciones, str): 
+                    
+                    if isinstance(opciones, str):
                         texto_final += f"🔹 <b>{nombre_mercado}:</b> {opciones}\n"
                     elif isinstance(opciones, dict):
                         texto_final += f"🔹 <b>{nombre_mercado}:</b>\n"
@@ -130,7 +119,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             texto_final += f"   • {seleccion}: {prob*100:.1f}%\n"
                         texto_final += "\n"
                 
-                texto_final += f"💡 Confianza del análisis: {pronostico.confianza.upper()}"
+                texto_final += f"\n💡 Confianza del análisis: {pronostico.confianza.upper()}"
                 
                 await query.edit_message_text(texto_final, parse_mode="HTML")
             else:
