@@ -66,6 +66,8 @@ class Orquestador:
                             liga_nombre = ev.get("league_name", "Otra Liga")
                             genero = str(ev.get("gender", "M"))
                             partidos.append({
+                                "local": h,
+                                "visitante": a,
                                 "texto": f"{h} vs {a}", 
                                 "hora": hora_str, 
                                 "liga": liga_nombre, 

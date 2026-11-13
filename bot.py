@@ -1,10 +1,8 @@
-"""Bot de Telegram Final - Cuadro Limpio sin Datos Vacíos."""
-from __future__ import annotations
 import logging
-import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 from agent.orquestador import Orquestador
+import os
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -12,158 +10,90 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 orquestador = Orquestador(bankroll=1000.0)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 <b>Bot de Pronosticos</b>\n\nEscribe <code>/hoy</code> para ver los partidos.", parse_mode="HTML")
+    await update.message.reply_text("¡Hola! Soy tu bot de pronósticos. Escribe /hoy para ver los partidos.")
 
 async def cmd_hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Buscando partidos disponibles en Bzzoiro...")
-    partidos = await orquestador.obtener_partidos_disponibles(limite=20) 
-    
-    if not partidos:
-        await update.message.reply_text("❌ No hay partidos disponibles en este momento.")
-        return
-
-    keyboard = []
-    for i, p in enumerate(partidos):
-        boton_texto = f"⏰ {p['hora']} | {p['texto']}" if p['hora'] else p['texto']
-        keyboard.append([InlineKeyboardButton(boton_texto, callback_data=f"an_{i}")])
-
-    context.user_data['partidos_hoy'] = partidos
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text("⚽ <b>Selecciona un partido para analizar:</b>", reply_markup=reply_markup, parse_mode="HTML")
+    await update.message.reply_text("⚽ ¿Qué fútbol quieres analizar hoy?", 
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👨 Fútbol Masculino", callback_data="gen_M"),
+             InlineKeyboardButton("👩 Fútbol Femenino", callback_data="gen_F")]
+        ])
+    )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
     data = query.data
-    if data.startswith("an_"):
+
+    if data.startswith("gen_"):
+        genero = data.split("_")[1]
+        await query.edit_message_text(text="🔍 Buscando partidos disponibles...")
+        
+        partidos = await orquestador.obtener_partidos_disponibles(limite=100)
+        filtrados = [p for p in partidos if p.get('genero', 'M') == genero]
+
+        if not filtrados:
+            await query.edit_message_text(f"No hay partidos de {'Masculino' if genero=='M' else 'Femenino'} disponibles ahora.")
+            return
+
+        ligas = list(set([p['liga'] for p in filtrados]))
+        
+        keyboard = []
+        for liga in ligas:
+            context.user_data[f"partidos_{liga}"] = [p for p in filtrados if p['liga'] == liga]
+            keyboard.append([InlineKeyboardButton(liga, callback_data=f"liga_{liga}")])
+        
+        keyboard.append([InlineKeyboardButton("⬅️ Volver", callback_data="volver")])
+        await query.edit_message_text("🏆 Selecciona la liga:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("liga_"):
+        liga = data.split("_", 1)[1]
+        partidos_liga = context.user_data.get(f"partidos_{liga}", [])
+
+        keyboard = []
+        for i, p in enumerate(partidos_liga):
+            context.user_data[f"partido_{i}"] = p
+            texto_boton = f"🕒 {p['hora']} | {p['texto']}"
+            keyboard.append([InlineKeyboardButton(texto_boton, callback_data=f"an_{i}")])
+        
+        keyboard.append([InlineKeyboardButton("⬅️ Volver a ligas", callback_data="volver")])
+        await query.edit_message_text(f"📅 Partidos de {liga}:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("an_"):
         idx = int(data.split("_")[1])
-        partidos = context.user_data.get('partidos_hoy', [])
+        partido = context.user_data.get(f"partido_{idx}")
         
-        if idx < len(partidos):
-            texto = partidos[idx]['texto']
-            await query.message.reply_text(f"🔍 Analizando <b>{texto}</b>...", parse_mode="HTML")
+        if partido:
+            await query.edit_message_text(f"🤖 Analizando <b>{partido['texto']}</b>...\n⏳ Esto puede tardar unos segundos.", parse_mode="HTML")
             
-            try:
-                r = await orquestador.procesar(texto, guardar=True)
-                p = r.probabilidades
-                m = r.mercados
+            # Llamamos a la función del orquestador que calcula el pronóstico
+            pronostico = await orquestador.generar_pronostico(partido['local'], partido['visitante'])
+            
+            if pronostico:
+                p = pronostico.probabilidades
+                texto_final = f"⚽ <b>{pronostico.local} vs {pronostico.visitante}</b>\n\n"
+                texto_final += f"📊 <b>Probabilidades del Modelo:</b>\n"
+                texto_final += f"🏠 Gana {pronostico.local}: {p.get('1', 0)*100:.1f}%\n"
+                texto_final += f"🤝 Empate: {p.get('X', 0)*100:.1f}%\n"
+                texto_final += f"✈️ Gana {pronostico.visitante}: {p.get('2', 0)*100:.1f}%\n\n"
+                texto_final += f"💡 Confianza del análisis: {pronostico.confianza.upper()}"
                 
-                picks = [
-                    ("Ganador Local", p.get('local', 0)), ("Ganador Empate", p.get('empate', 0)), ("Ganador Visita", p.get('visitante', 0)),
-                    ("Doble Oportunidad 1X", m.get('doble_1x', 0)), ("Doble Oportunidad 12", m.get('doble_12', 0)), ("Doble Oportunidad X2", m.get('doble_x2', 0)),
-                    ("Over 1.5 Goles", m.get('over_15', 0)), ("Over 2.5 Goles", m.get('over_25', 0)), ("Over 3.5 Goles", m.get('over_35', 0)),
-                    ("Hándicap Local -0.5", m.get('hcp_local_m05', 0)), ("Hándicap Local -1.5", m.get('hcp_local_m15', 0)), ("Hándicap Visita +0.5", m.get('hcp_visita_p05', 0)),
-                    ("Ambos Anotan (Sí)", m.get('btts_si', 0)), ("Ambos Anotan (No)", m.get('btts_no', 0)),
-                ]
-                picks.sort(key=lambda x: x[1], reverse=True)
-                top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
-
-                # ELIMINAMOS LA HORA Y EL MARCADOR DEL CUADRO
-                cuadro = f"""
-┌─────────────────────────────────┐
-│ ⚽ {r.local} vs {r.visitante}
-│ Fuente: {r.fuente}
-├─────────────────────────────────┤
-│ MERCADO        │ SELECCION │ PROB
-├─────────────────────────────────┤
-│ Ganador        │ Local     │ {p.get('local',0)*100:.1f}%
-│ Ganador        │ Empate    │ {p.get('empate',0)*100:.1f}%
-│ Ganador        │ Visita    │ {p.get('visitante',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Doble Oport.   │ 1X        │ {m.get('doble_1x',0)*100:.1f}%
-│ Doble Oport.   │ 12        │ {m.get('doble_12',0)*100:.1f}%
-│ Doble Oport.   │ X2        │ {m.get('doble_x2',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Goles          │ Over 1.5  │ {m.get('over_15',0)*100:.1f}%
-│ Goles          │ Over 2.5  │ {m.get('over_25',0)*100:.1f}%
-│ Goles          │ Over 3.5  │ {m.get('over_35',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Handicap       │ Loc -0.5  │ {m.get('hcp_local_m05',0)*100:.1f}%
-│ Handicap       │ Loc -1.5  │ {m.get('hcp_local_m15',0)*100:.1f}%
-│ Handicap       │ Vis +0.5  │ {m.get('hcp_visita_p05',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Ambos Anotan   │ Si        │ {m.get('btts_si',0)*100:.1f}%
-│ Ambos Anotan   │ No        │ {m.get('btts_no',0)*100:.1f}%
-└─────────────────────────────────┘
-"""
-                mensaje = (
-                    f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n\n"
-                    f"🔥 <b>TOP PICKS:</b>\n{top_texto}\n"
-                    f"📊 <b>Desglose:</b>\n<pre>{cuadro}</pre>\n"
-                    f"🎯 Confianza: <b>{r.confianza.upper()}</b>"
-                )
-                await query.message.reply_text(mensaje, parse_mode="HTML")
-            except Exception as e:
-                await query.message.reply_text(f"❌ Error: {e}")
-
-async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Uso: <code>/analizar Local vs Visitante</code>", parse_mode="HTML")
-        return
-    texto = " ".join(context.args)
-    await update.message.reply_text(f"🔍 Analizando <b>{texto}</b>...", parse_mode="HTML")
-    
-    try:
-        r = await orquestador.procesar(texto, guardar=True)
-        p = r.probabilidades
-        m = r.mercados
-        
-        picks = [
-            ("Ganador Local", p.get('local', 0)), ("Ganador Empate", p.get('empate', 0)), ("Ganador Visita", p.get('visitante', 0)),
-            ("Doble Oportunidad 1X", m.get('doble_1x', 0)), ("Doble Oportunidad 12", m.get('doble_12', 0)), ("Doble Oportunidad X2", m.get('doble_x2', 0)),
-            ("Over 1.5 Goles", m.get('over_15', 0)), ("Over 2.5 Goles", m.get('over_25', 0)), ("Over 3.5 Goles", m.get('over_35', 0)),
-            ("Hándicap Local -0.5", m.get('hcp_local_m05', 0)), ("Hándicap Local -1.5", m.get('hcp_local_m15', 0)), ("Hándicap Visita +0.5", m.get('hcp_visita_p05', 0)),
-            ("Ambos Anotan (Sí)", m.get('btts_si', 0)), ("Ambos Anotan (No)", m.get('btts_no', 0)),
-        ]
-        picks.sort(key=lambda x: x[1], reverse=True)
-        top_texto = "".join([f"• <b>{n}: {pr*100:.1f}%</b>\n" for n, pr in picks[:3]])
-
-        cuadro = f"""
-┌─────────────────────────────────┐
-│ ⚽ {r.local} vs {r.visitante}
-│ Fuente: {r.fuente}
-├─────────────────────────────────┤
-│ MERCADO        │ SELECCION │ PROB
-├─────────────────────────────────┤
-│ Ganador        │ Local     │ {p.get('local',0)*100:.1f}%
-│ Ganador        │ Empate    │ {p.get('empate',0)*100:.1f}%
-│ Ganador        │ Visita    │ {p.get('visitante',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Doble Oport.   │ 1X        │ {m.get('doble_1x',0)*100:.1f}%
-│ Doble Oport.   │ 12        │ {m.get('doble_12',0)*100:.1f}%
-│ Doble Oport.   │ X2        │ {m.get('doble_x2',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Goles          │ Over 1.5  │ {m.get('over_15',0)*100:.1f}%
-│ Goles          │ Over 2.5  │ {m.get('over_25',0)*100:.1f}%
-│ Goles          │ Over 3.5  │ {m.get('over_35',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Handicap       │ Loc -0.5  │ {m.get('hcp_local_m05',0)*100:.1f}%
-│ Handicap       │ Loc -1.5  │ {m.get('hcp_local_m15',0)*100:.1f}%
-│ Handicap       │ Vis +0.5  │ {m.get('hcp_visita_p05',0)*100:.1f}%
-├─────────────────────────────────┤
-│ Ambos Anotan   │ Si        │ {m.get('btts_si',0)*100:.1f}%
-│ Ambos Anotan   │ No        │ {m.get('btts_no',0)*100:.1f}%
-└─────────────────────────────────┘
-"""
-        mensaje = (
-            f"⭐ <b>PRONÓSTICO: {r.local} vs {r.visitante}</b>\n\n"
-            f"🔥 <b>TOP PICKS:</b>\n{top_texto}\n"
-            f"📊 <b>Desglose:</b>\n<pre>{cuadro}</pre>\n"
-            f"🎯 Confianza: <b>{r.confianza.upper()}</b>"
+                await query.edit_message_text(texto_final, parse_mode="HTML")
+            else:
+                await query.edit_message_text("❌ No se pudieron obtener los datos del pronóstico para este partido. Intenta con otro.")
+            
+    elif data == "volver":
+        await query.edit_message_text("⚽ ¿Qué fútbol quieres analizar hoy?", 
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👨 Fútbol Masculino", callback_data="gen_M"),
+                 InlineKeyboardButton("👩 Fútbol Femenino", callback_data="gen_F")]
+            ])
         )
-        await update.message.reply_text(mensaje, parse_mode="HTML")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
 
-def main():
+if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("hoy", cmd_hoy))
-    app.add_handler(CommandHandler("analizar", cmd_analizar))
     app.add_handler(CallbackQueryHandler(button_callback))
+    logger.info("Bot iniciado y escuchando...")
     app.run_polling()
-
-if __name__ == "__main__":
-    main()
