@@ -66,21 +66,75 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if partido:
             await query.edit_message_text(f"🤖 Analizando <b>{partido['texto']}</b>...\n⏳ Esto puede tardar unos segundos.", parse_mode="HTML")
             
-            # Llamamos a la función del orquestador que calcula el pronóstico
             pronostico = await orquestador.generar_pronostico(partido['local'], partido['visitante'])
             
             if pronostico:
-                p = pronostico.probabilidades
+                # 1. Recopilar todas las probabilidades en una lista
+                todos_los_picks = []
+                
+                # Añadir 1X2
+                p_1x2 = pronostico.probabilidades
+                for sel, prob in p_1x2.items():
+                    nombre_sel = pronostico.local if sel == '1' else 'Empate' if sel == 'X' else pronostico.visitante
+                    todos_los_picks.append((prob, f"Gana {nombre_sel}"))
+                
+                # Añadir mercados secundarios
+                for nombre_mercado, opciones in pronostico.mercados.items():
+                    if nombre_mercado == "1X2" or opciones == "NO RECOMENDADO":
+                        continue
+                    
+                    if isinstance(opciones, dict):
+                        for sel, prob in opciones.items():
+                            todos_los_picks.append((prob, f"{nombre_mercado} - {sel}"))
+                    elif isinstance(opciones, str):
+                        # Extraer el porcentaje de string tipo "Over 1.5 (74.3%)"
+                        try:
+                            nombre = opciones.split(" (")[0]
+                            prob_str = opciones.split("(")[1].replace("%)", "")
+                            prob = float(prob_str) / 100.0
+                            todos_los_picks.append((prob, nombre))
+                        except:
+                            pass
+                
+                # 2. Ordenar de mayor a menor y sacar el Top 3
+                todos_los_picks.sort(key=lambda x: x[0], reverse=True)
+                top_3 = todos_los_picks[:3]
+
+                # 3. Construir el mensaje
                 texto_final = f"⚽ <b>{pronostico.local} vs {pronostico.visitante}</b>\n\n"
-                texto_final += f"📊 <b>Probabilidades del Modelo:</b>\n"
-                texto_final += f"🏠 Gana {pronostico.local}: {p.get('1', 0)*100:.1f}%\n"
-                texto_final += f"🤝 Empate: {p.get('X', 0)*100:.1f}%\n"
-                texto_final += f"✈️ Gana {pronostico.visitante}: {p.get('2', 0)*100:.1f}%\n\n"
+                
+                # Añadir TOP PICKS en negrita arriba
+                texto_final += "🔥 <b>TOP PICKS:</b>\n"
+                for prob, nombre in top_3:
+                    texto_final += f"• <b>{nombre}: {prob*100:.1f}%</b>\n"
+                texto_final += "\n"
+                
+                # Añadir el desglose completo
+                texto_final += "📊 <b>Desglose:</b>\n"
+                
+                texto_final += f"🏠 Gana {pronostico.local}: {p_1x2.get('1', 0)*100:.1f}%\n"
+                texto_final += f"🤝 Empate: {p_1x2.get('X', 0)*100:.1f}%\n"
+                texto_final += f"✈️ Gana {pronostico.visitante}: {p_1x2.get('2', 0)*100:.1f}%\n\n"
+                
+                for nombre_mercado, opciones in pronostico.mercados.items():
+                    if nombre_mercado == "1X2":
+                        continue
+                        
+                    if opciones == "NO RECOMENDADO":
+                        texto_final += f"⚠️ <b>{nombre_mercado}:</b> NO RECOMENDADO (Faltan datos)\n\n"
+                    elif isinstance(opciones, str): 
+                        texto_final += f"🔹 <b>{nombre_mercado}:</b> {opciones}\n"
+                    elif isinstance(opciones, dict):
+                        texto_final += f"🔹 <b>{nombre_mercado}:</b>\n"
+                        for seleccion, prob in opciones.items():
+                            texto_final += f"   • {seleccion}: {prob*100:.1f}%\n"
+                        texto_final += "\n"
+                
                 texto_final += f"💡 Confianza del análisis: {pronostico.confianza.upper()}"
                 
                 await query.edit_message_text(texto_final, parse_mode="HTML")
             else:
-                await query.edit_message_text("❌ No se pudieron obtener los datos del pronóstico para este partido. Intenta con otro.")
+                await query.edit_message_text("❌ No se pudieron obtener los datos del pronóstico para este partido. Intenta de nuevo.")
             
     elif data == "volver":
         await query.edit_message_text("⚽ ¿Qué fútbol quieres analizar hoy?", 
