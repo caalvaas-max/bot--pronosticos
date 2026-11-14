@@ -30,19 +30,21 @@ class Orquestador:
         self.bankroll = bankroll
 
     async def obtener_partidos_disponibles(self, limite: int = 20) -> list:
-        hoy = datetime.datetime.now().strftime("%Y-%m-%d")
         try:
             async with httpx.AsyncClient(timeout=15.0) as c:
-                r = await c.get(f"{BASE_URL}/matches?date={hoy}&limit={limite}", headers=self.headers)
+                # Quitamos la fecha para que traiga los partidos disponibles (ayer/hoy)
+                r = await c.get(f"{BASE_URL}/matches?limit={limite}", headers=self.headers)
                 if r.status_code == 200:
                     data = r.json()
                     partidos = []
-                    results = data.get("data", data.get("matches", []))
+                    # La API devuelve los datos en "data"
+                    results = data.get("data", [])
                     for item in results:
-                        h = item.get("home_team", {}).get("name", "") or item.get("home", "")
-                        a = item.get("away_team", {}).get("name", "") or item.get("away", "")
-                        liga = item.get("league", {}).get("name", "Otra Liga") or item.get("league_name", "Otra Liga")
-                        fecha = item.get("date", "")
+                        # Leyendo las llaves exactas que vimos en la imagen
+                        h = item.get("home_team_name", "")
+                        a = item.get("away_team_name", "")
+                        liga = item.get("league_name", "Otra Liga")
+                        fecha = item.get("match_date", "")
                         
                         if h and a:
                             partidos.append({
@@ -66,6 +68,7 @@ class Orquestador:
 
     async def generar_pronostico(self, local: str, visitante: str) -> Optional[RespuestaPronostico]:
         try:
+            # Goles esperados aleatorios para probar el motor matemático
             import random
             lambda_local = random.uniform(0.8, 2.2)
             lambda_visitante = random.uniform(0.6, 1.8)
